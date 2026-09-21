@@ -42,6 +42,16 @@ per-day session log.
 
 ## Install
 
+### One-line install (recommended)
+
+```bash
+omarchy plugin add abdullahazmy/abdullah.adhd-pomodoro --enable
+omarchy restart shell
+omarchy bar move abdullah.adhd-pomodoro --section center
+```
+
+### Manual install
+
 The plugin lives in `~/.config/omarchy/plugins/abdullah.adhd-pomodoro/`,
 which is the user plugin directory Omarchy scans on startup. If you got
 this from a git repo, drop the folder there.
@@ -58,6 +68,34 @@ Add the bar widget to your bar layout:
 ```bash
 omarchy bar move abdullah.adhd-pomodoro --section center
 ```
+
+## Remove
+
+```bash
+omarchy plugin disable abdullah.adhd-pomodoro
+omarchy plugin remove abdullah.adhd-pomodoro --yes
+omarchy restart shell
+rm -rf ~/.local/state/abdullah.adhd-pomodoro   # optional: delete state and history
+```
+
+`omarchy plugin remove` deletes the plugin folder from
+`~/.config/omarchy/plugins/` and unwires the bar entry from
+`shell.json`. The state directory under `~/.local/state/` is left in
+place in case you reinstall; delete it manually if you want a clean
+slate.
+
+## Dependencies
+
+- `omarchy-notification-send` (shipped with Omarchy)
+- `paplay` (from `pulseaudio-utils` / `pipewire-pulse`) — only used for
+  the optional end-of-phase chime; the plugin silently no-ops if missing.
+
+## Uninstall safety
+
+This plugin only writes inside `~/.local/state/abdullah.adhd-pomodoro/`
+and the Omarchy user config. It does not modify `/usr/share/omarchy/`,
+your shell startup files, or any application config outside its own
+state directory.
 
 (or edit `~/.config/omarchy/shell.json` by hand if you want it
 somewhere specific).
