@@ -1,0 +1,14 @@
+# OS / editor scratch
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Build / cache artifacts
+*.qmlls.ini
+.qmllint.ini
+
+# Local Quickshell logs (when the plugin is run from this checkout)
+*.qslog

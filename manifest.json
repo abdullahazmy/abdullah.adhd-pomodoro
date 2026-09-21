@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "abdullah.adhd-pomodoro",
+  "name": "ADHD Pomodoro",
+  "version": "0.1.0",
+  "author": "abdullah",
+  "license": "MIT",
+  "description": "ADHD-friendly Pomodoro timer: visible countdown in the bar, gentle pre-warnings, plain-text task labels, and a per-day session log.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "PomodoroService.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "service": {
+    "summary": "Owns the Pomodoro timer state, persists to state.json, and fires phase-transition notifications."
+  },
+  "barWidget": {
+    "displayName": "ADHD Pomodoro",
+    "description": "Bar countdown with phase glyph, task label, and progress dots toward the daily goal. Click to open the panel; right-click to pause; middle-click to skip the current phase.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {},
+    "schema": []
+  }
+}
