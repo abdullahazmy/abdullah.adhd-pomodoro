@@ -86,16 +86,14 @@ Panel {
 
   // ---- Actions ------------------------------------------------------------
 
-  function startOrResume() {
+  function toggleTimerControl() {
     if (!service) return
-    if (phase === Model.PHASE_PAUSED) service.resume()
-    else service.start()
-  }
-
-  function togglePauseResume() {
-    if (!service) return
+    // IDLE -> start a fresh WORK block.
+    // PAUSED -> resume into the phase we paused in.
+    // WORK / SHORT_BREAK / LONG_BREAK -> pause.
     if (canPause) service.pause()
     else if (canResume) service.resume()
+    else if (canStart) service.start()
   }
 
   function updateSetting(key, value) {
@@ -271,7 +269,7 @@ Panel {
           verticalPadding: Style.spacing.controlPaddingY
           bordered: true
           focusable: true
-          onClicked: root.togglePauseResume()
+          onClicked: root.toggleTimerControl()
           Layout.fillWidth: true
         }
 

@@ -50,12 +50,24 @@ BarWidget {
   readonly property int goalTotal: Math.max(dailyGoal, 1)
 
   // ---- Panel wiring (popout contract) -------------------------------------
+  // The shell's `findPanelWidget` walks each live bar-widget slot and looks
+  // for `open()`, `close()`, and an `opened` property on the widget root.
+  // Defining those three names here is what makes `bar.shell.summon(...)`
+  // and `bar.shell.togglePanel(...)` actually reach our popup. (Naming the
+  // functions `openPanel`/`closePanel` is the bug that made the IPC toggle
+  // no-op with "summon: no live bar widget".)
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
   readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
 
-  function openPanel() { if (panelLoader.item) panelLoader.item.open() }
-  function closePanel() { if (panelLoader.item) panelLoader.item.close() }
-  function togglePanel() { if (panelLoader.item) panelLoader.item.toggle() }
+  function open() {
+    if (panelLoader.item) panelLoader.item.open()
+  }
+  function close() {
+    if (panelLoader.item) panelLoader.item.close()
+  }
+  function toggle() {
+    if (panelLoader.item) panelLoader.item.toggle()
+  }
   function closeForPopoutSwitch() {
     if (panelLoader.item) panelLoader.item.closeForPopoutSwitch()
   }
@@ -115,7 +127,7 @@ BarWidget {
       } else if (b === Qt.MiddleButton) {
         root.service.skip()
       } else {
-        root.togglePanel()
+        root.toggle()
       }
     }
 
