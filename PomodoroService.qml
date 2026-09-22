@@ -365,6 +365,11 @@ Item {
     function resume(): void { root.resume() }
     function reset(): void { root.reset() }
     function skip(): void { root.skip() }
+    function toggleSound(): void {
+      var next = Object.assign({}, root.settings)
+      next.soundOnPhaseEnd = !next.soundOnPhaseEnd
+      root.updateSettings(next)
+    }
     function setTask(label: string): void { root.setTask(label || "") }
     function updateSettings(jsonString: string): void {
       var parsed

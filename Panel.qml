@@ -259,6 +259,7 @@ Panel {
         spacing: Style.space(6)
 
         Button {
+          objectName: "startButton"
           text: root.canPause ? "Pause"
                 : root.canResume ? "Resume"
                 : root.canStart ? "Start focus" : "Start"
@@ -524,11 +525,19 @@ Panel {
         Row {
           width: parent.width
           spacing: Style.space(8)
+          // Match the row height to the toggle so the MouseArea fills the
+          // control and never gets clipped by an under-sized Row.
+          height: Math.max(implicitHeight, Style.space(28))
 
           ToggleSwitch {
+            id: soundToggle
             checked: root.settings.soundOnPhaseEnd
             foreground: root.bar.foreground
+            interactive: true
+            // The Text label is also clickable; clicking anywhere in the row
+            // toggles the switch so the affordance is generous.
             onToggled: root.updateSetting("soundOnPhaseEnd", checked)
+            anchors.verticalCenter: parent.verticalCenter
           }
           Text {
             textFormat: Text.PlainText
@@ -537,17 +546,26 @@ Panel {
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
             anchors.verticalCenter: parent.verticalCenter
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: soundToggle.checked = !soundToggle.checked
+            }
           }
         }
 
         Row {
           width: parent.width
           spacing: Style.space(8)
+          height: Math.max(implicitHeight, Style.space(28))
 
           ToggleSwitch {
+            id: autostartToggle
             checked: root.settings.autostartNext
             foreground: root.bar.foreground
+            interactive: true
             onToggled: root.updateSetting("autostartNext", checked)
+            anchors.verticalCenter: parent.verticalCenter
           }
           Text {
             textFormat: Text.PlainText
@@ -556,6 +574,11 @@ Panel {
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
             anchors.verticalCenter: parent.verticalCenter
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: autostartToggle.checked = !autostartToggle.checked
+            }
           }
         }
       }
