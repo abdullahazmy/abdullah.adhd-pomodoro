@@ -8,6 +8,15 @@
 // State persistence is JSON. The service owns the timer; the panel reads from
 // it via `bar.shell.serviceFor(...)` rather than reading the file itself, so
 // the two never disagree about which second the timer is on.
+//
+// Timing model (v0.1.5+): the service stores `phaseStartedAt` (epoch ms)
+// and `phaseDurationSecs`, then computes `secondsLeft` on demand from the
+// wall clock. A running phase has no per-second timer while the popup is
+// closed and we are more than a minute from phase end — only a single
+// 60-second timer that handles phase-end detection, pre-warning
+// boundaries, and `secondsLeft` recomputation. This means the bar widget
+// stays accurate to within one second even with no per-second wake-up,
+// and a paused or idle plugin uses no timers at all.
 
 // ---------- Phase constants -------------------------------------------------
 
@@ -30,6 +39,10 @@ function phaseMinutes(phase, settings) {
   if (phase === PHASE_SHORT_BREAK) return settings.shortBreakMinutes;
   if (phase === PHASE_LONG_BREAK) return settings.longBreakMinutes;
   return 0;
+}
+
+function phaseSeconds(phase, settings) {
+  return phaseMinutes(phase, settings) * 60;
 }
 
 function phaseLabel(phase) {
@@ -61,21 +74,15 @@ function formatMMSS(totalSeconds) {
   return (m < 10 ? "0" : "") + m + ":" + (r < 10 ? "0" : "") + r;
 }
 
-// ---------- State machine ---------------------------------------------------
+// ---------- Timing math -----------------------------------------------------
 
-// Given the current phase, completed-sessions-today, and settings, return the
-// phase we should transition into when the current phase's timer hits zero.
-// WORK -> SHORT_BREAK unless we just hit a long-break boundary.
-// SHORT_BREAK / LONG_BREAK -> WORK.
-function nextPhase(currentPhase, completedWorkSessions, settings) {
-  if (currentPhase === PHASE_WORK) {
-    var next = completedWorkSessions + 1;
-    return (next % settings.longBreakInterval === 0) ? PHASE_LONG_BREAK : PHASE_SHORT_BREAK;
-  }
-  if (currentPhase === PHASE_SHORT_BREAK || currentPhase === PHASE_LONG_BREAK) {
-    return PHASE_WORK;
-  }
-  return PHASE_IDLE;
+// Compute secondsLeft for a running phase from `phaseStartedAt` and the
+// current epoch ms. Returns 0 once the phase has ended.
+function secondsLeftFromStart(phaseStartedAt, phaseDurationSecs, nowMs) {
+  if (!phaseStartedAt || !phaseDurationSecs) return 0
+  if (nowMs === undefined) nowMs = Date.now()
+  var elapsed = Math.floor((nowMs - phaseStartedAt) / 1000)
+  return Math.max(0, phaseDurationSecs - elapsed)
 }
 
 // Decide whether a phase's secondsLeft represents a "pre-warning" — i.e. one
@@ -93,6 +100,23 @@ function shouldFirePreWarning(secondsLeft, preWarningSeconds, lastFiredSeconds) 
   return false;
 }
 
+// ---------- State machine ---------------------------------------------------
+
+// Given the current phase, completed-sessions-today, and settings, return the
+// phase we should transition into when the current phase's timer hits zero.
+// WORK -> SHORT_BREAK unless we just hit a long-break boundary.
+// SHORT_BREAK / LONG_BREAK -> WORK.
+function nextPhase(currentPhase, completedWorkSessions, settings) {
+  if (currentPhase === PHASE_WORK) {
+    var next = completedWorkSessions + 1;
+    return (next % settings.longBreakInterval === 0) ? PHASE_LONG_BREAK : PHASE_SHORT_BREAK;
+  }
+  if (currentPhase === PHASE_SHORT_BREAK || currentPhase === PHASE_LONG_BREAK) {
+    return PHASE_WORK;
+  }
+  return PHASE_IDLE;
+}
+
 // ---------- Default settings ----------------------------------------------
 
 function defaultSettings() {
@@ -108,11 +132,19 @@ function defaultSettings() {
   };
 }
 
+// Build a freshly-initialised state. We deliberately do not store
+// `secondsLeft`; the service computes it from `phaseStartedAt` and the
+// wall clock. `phaseStartedAt` is null in IDLE — there is nothing
+// running. PAUSED uses `phasePausedSecondsLeft` as the source of truth
+// because we want a paused timer to read the same value no matter how
+// long the pause lasts.
 function defaultState() {
   var s = defaultSettings();
   return {
     phase: PHASE_IDLE,
-    secondsLeft: s.workMinutes * 60,
+    phaseStartedAt: null,
+    phaseDurationSecs: 0,
+    phasePausedSecondsLeft: 0,
     completedWorkSessionsToday: 0,
     lastResetDate: todayKey(),
     taskLabel: "",
@@ -166,17 +198,51 @@ function mergeSettings(persisted) {
   return s;
 }
 
+// Accept both the new timestamp schema and the old `secondsLeft`-based
+// schema. On a running phase with the old schema, seed `phaseStartedAt`
+// so that `secondsLeftFromStart(...)` returns the previously-stored
+// `secondsLeft` at the moment of load — preserving the user's progress
+// without forcing a phase restart.
 function mergeState(persisted) {
   var base = defaultState();
   if (!persisted || typeof persisted !== "object") return base;
+
   base.phase = (persisted.phase && typeof persisted.phase === "string") ? persisted.phase : base.phase;
-  base.secondsLeft = Number(persisted.secondsLeft) || base.secondsLeft;
   base.completedWorkSessionsToday = Number(persisted.completedWorkSessionsToday) || 0;
   base.lastResetDate = persisted.lastResetDate || base.lastResetDate;
   base.taskLabel = typeof persisted.taskLabel === "string" ? persisted.taskLabel : "";
   base.settings = mergeSettings(persisted.settings);
   base.lastFiredWarningSeconds = Array.isArray(persisted.lastFiredWarningSeconds)
     ? persisted.lastFiredWarningSeconds.slice() : [];
+
+  // New schema: explicit timestamps.
+  if (typeof persisted.phaseStartedAt === "number" && typeof persisted.phaseDurationSecs === "number") {
+    base.phaseStartedAt = persisted.phaseStartedAt;
+    base.phaseDurationSecs = persisted.phaseDurationSecs;
+  }
+  if (typeof persisted.phasePausedSecondsLeft === "number") {
+    base.phasePausedSecondsLeft = persisted.phasePausedSecondsLeft;
+  }
+
+  // Old schema migration: a running phase with `secondsLeft` gets a
+  // synthetic `phaseStartedAt` so the wall-clock math gives the same value.
+  if (base.phase === PHASE_PAUSED && typeof persisted.phasePausedSecondsLeft === "undefined"
+      && typeof persisted.secondsLeft === "number") {
+    base.phasePausedSecondsLeft = Math.max(0, Math.floor(persisted.secondsLeft));
+  }
+  if (isRunningPhase(base.phase) && !base.phaseStartedAt
+      && typeof persisted.secondsLeft === "number") {
+    var remaining = Math.max(0, Math.floor(persisted.secondsLeft));
+    var duration = phaseSeconds(base.phase, base.settings);
+    if (duration > 0) {
+      base.phaseDurationSecs = duration;
+      // Anchor phaseStartedAt so that `secondsLeftFromStart` returns
+      // `remaining` at "now". The 1000 ms drift is harmless: the slow
+      // timer will correct it within a second.
+      base.phaseStartedAt = Date.now() - (duration - remaining) * 1000;
+    }
+  }
+
   return base;
 }
 

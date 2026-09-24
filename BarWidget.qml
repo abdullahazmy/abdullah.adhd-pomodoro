@@ -59,6 +59,16 @@ BarWidget {
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
   readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
 
+  // Push the panel's open state into the service so it can switch between
+  // the 60-second slow tick and the per-second fast tick. Bound to the
+  // resolved `opened` property above so it fires on every open/close,
+  // including the very first time the panel is shown.
+  onOpenedChanged: {
+    if (root.serviceReady && root.service && typeof root.service.setPopupOpen === "function") {
+      root.service.setPopupOpen(root.opened)
+    }
+  }
+
   function open() {
     if (panelLoader.item) panelLoader.item.open()
   }

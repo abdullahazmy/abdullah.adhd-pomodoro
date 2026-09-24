@@ -8,14 +8,27 @@ import "Model.js" as Model
 // `bar.shell.serviceFor("abdullah.adhd-pomodoro")`.
 //
 // The service owns:
-//   - The wall-clock Timer that ticks once per second while running.
 //   - Persistent state in ~/.local/state/abdullah.adhd-pomodoro/state.json
 //     (atomic write via FileView) and an append-only history file.
 //   - IPC routes on `abdullah.adhd-pomodoro` for the panel and any future
 //     CLI helper.
 //
-// The bar widget reads reactive properties off this object; the popup panel
-// calls the public methods (start/pause/resume/reset/skip/setTask/updateSettings).
+// Timing model (v0.1.5+): the service stores `phaseStartedAt` (epoch ms)
+// and `phaseDurationSecs`, then computes `secondsLeft` on demand from the
+// wall clock. Two timers:
+//
+//   slowTick (60s)        — runs while a phase is active. Handles phase-end
+//                           detection, recomputes secondsLeft so the bar
+//                           stays within a second of true time, and fires
+//                           any pre-warning notifications whose boundary
+//                           fell inside the minute we just slept through.
+//
+//   fastTick (1s)         — runs only while the popup is open or while
+//                           secondsLeft <= 60. Drives the visible
+//                           countdown to second resolution and detects
+//                           phase end promptly in the last minute.
+//
+// A paused or idle plugin uses no timers at all.
 Item {
   id: root
 
@@ -29,24 +42,63 @@ Item {
   readonly property string statePath: stateHome + "/state.json"
   readonly property string historyPath: stateHome + "/history.jsonl"
 
-  // ---- Live state (mirror of state.json, republish on every tick) ----------
-  // These are reactive so bar widgets and the popup panel can bind directly.
+  // ---- Persistent state ----------------------------------------------------
+  // `phase`, `phaseStartedAt`, `phaseDurationSecs`, and
+  // `phasePausedSecondsLeft` mirror state.json. Reactive so the bar and
+  // popup can bind to them. `secondsLeft` is *not* stored — it is derived
+  // from the wall clock and the timestamp fields via the function below.
   property string phase: Model.PHASE_IDLE
-  property int secondsLeft: 0
+  // epoch ms when the current phase began; null while IDLE.
+  property var phaseStartedAt: null
+  property int phaseDurationSecs: 0
+  // Frozen secondsLeft captured at pause time. Source of truth while
+  // phase === PAUSED so a paused timer never drifts.
+  property int phasePausedSecondsLeft: 0
   property int completedWorkSessionsToday: 0
   property string lastResetDate: ""
   property string taskLabel: ""
-  // Last-fired-seconds memo is not exposed to the bar; it lives only on
-  // this object so we can de-dupe pre-warning notifications.
+  // Memo of pre-warning seconds we have already announced in this phase.
   property var lastFiredWarningSeconds: []
 
   // Settings — mutated only through updateSettings(), which persists.
   property var settings: Model.defaultSettings()
 
+  // ---- Derived live state --------------------------------------------------
+  // Cached integer recomputed by `recomputeSeconds()` so that bindings on
+  // the bar widget update on every tick (or on every slowTick, when the
+  // popup is closed). When IDLE or PAUSED, returns the static value.
+  property int secondsLeft: 0
+
+  function recomputeSeconds() {
+    var s
+    if (phase === Model.PHASE_PAUSED) {
+      s = Math.max(0, phasePausedSecondsLeft)
+    } else if (Model.isRunningPhase(phase) && phaseStartedAt && phaseDurationSecs) {
+      s = Model.secondsLeftFromStart(phaseStartedAt, phaseDurationSecs, Date.now())
+    } else {
+      // IDLE: nothing running. Show the upcoming WORK duration so the
+      // panel can render the "Start focus" hero with a sensible number.
+      s = Model.phaseSeconds(Model.PHASE_WORK, settings)
+    }
+    if (s !== root.secondsLeft) root.secondsLeft = s
+    return s
+  }
+
+  // Whether the popup wants second-resolution. Set by the bar widget and
+  // panel as they open/close. Cleared on destruction.
+  property bool popupOpen: false
+
+  function setPopupOpen(open) {
+    var next = !!open
+    if (next === root.popupOpen) return
+    root.popupOpen = next
+    // Toggling the popup may move us in or out of the "last minute"
+    // fast-tick window. Recompute and reschedule.
+    if (Model.isRunningPhase(root.phase)) rescheduleTimers()
+  }
+
   // ---- Load on startup ------------------------------------------------------
   Component.onCompleted: {
-    // Ensure ~/.local/state/abdullah.adhd-pomodoro exists, then reload
-    // the state and history files. mkdirProc triggers the reload on exit.
     mkdirProc.running = true
   }
 
@@ -79,12 +131,16 @@ Item {
 
   function applyParsedState(parsed) {
     root.phase = parsed.phase
-    root.secondsLeft = parsed.secondsLeft
+    root.phaseStartedAt = parsed.phaseStartedAt
+    root.phaseDurationSecs = parsed.phaseDurationSecs
+    root.phasePausedSecondsLeft = parsed.phasePausedSecondsLeft
     root.completedWorkSessionsToday = parsed.completedWorkSessionsToday
     root.lastResetDate = parsed.lastResetDate
     root.taskLabel = parsed.taskLabel
     root.settings = parsed.settings
     root.lastFiredWarningSeconds = parsed.lastFiredWarningSeconds
+    recomputeSeconds()
+    rescheduleTimers()
     broadcastStatus()
   }
 
@@ -92,7 +148,9 @@ Item {
   function buildStateObject() {
     return {
       phase: root.phase,
-      secondsLeft: root.secondsLeft,
+      phaseStartedAt: root.phaseStartedAt,
+      phaseDurationSecs: root.phaseDurationSecs,
+      phasePausedSecondsLeft: root.phasePausedSecondsLeft,
       completedWorkSessionsToday: root.completedWorkSessionsToday,
       lastResetDate: root.lastResetDate,
       taskLabel: root.taskLabel,
@@ -120,71 +178,82 @@ Item {
   }
 
   function start() {
-    // If we were paused, resume into the same phase. Otherwise, start a
-    // fresh WORK block. The panel UI is the primary caller; IPC `start` is
-    // here so an external CLI helper could kick the timer too.
+    // IDLE / PAUSED -> start (or resume) a fresh WORK block.
     if (root.phase === Model.PHASE_PAUSED) {
-      // Resume: figure out which phase we paused in from settings + state.
-      // We store the paused phase implicitly by leaving secondsLeft where it
-      // was, but phase itself says PAUSED. Easiest: infer from secondsLeft.
-      var resumed = inferPhaseFromSecondsLeft()
-      if (resumed) root.phase = resumed
-    }
-    if (!Model.isRunningPhase(root.phase)) {
+      // Resume from the frozen paused value.
+      var duration = phaseSeconds(inferPhaseFromPaused())
+      var remaining = Math.max(0, root.phasePausedSecondsLeft)
+      root.phase = inferPhaseFromPaused()
+      root.phaseStartedAt = Date.now() - (duration - remaining) * 1000
+      root.phaseDurationSecs = duration
+      root.phasePausedSecondsLeft = 0
+      root.lastFiredWarningSeconds = []
+    } else if (!Model.isRunningPhase(root.phase)) {
       root.phase = Model.PHASE_WORK
-      root.secondsLeft = phaseSeconds(Model.PHASE_WORK)
+      root.phaseDurationSecs = phaseSeconds(Model.PHASE_WORK)
+      root.phaseStartedAt = Date.now()
+      root.phasePausedSecondsLeft = 0
       root.lastFiredWarningSeconds = []
     }
-    tickTimer.running = true
+    recomputeSeconds()
+    rescheduleTimers()
     saveState()
     broadcastStatus()
   }
 
   function pause() {
     if (!Model.isRunningPhase(root.phase)) return
-    tickTimer.running = false
+    // Freeze the current countdown so the user sees the same value no
+    // matter how long they stay paused.
+    var s = recomputeSeconds()
+    root.phasePausedSecondsLeft = s
     root.phase = Model.PHASE_PAUSED
+    rescheduleTimers()
     saveState()
     broadcastStatus()
   }
 
   function resume() {
     if (root.phase !== Model.PHASE_PAUSED) return
-    var resumed = inferPhaseFromSecondsLeft()
-    if (resumed) root.phase = resumed
-    tickTimer.running = true
+    // Convert the frozen paused value into a fresh timestamp.
+    var phaseName = inferPhaseFromPaused()
+    var duration = phaseSeconds(phaseName)
+    var remaining = Math.max(0, root.phasePausedSecondsLeft)
+    root.phase = phaseName
+    root.phaseStartedAt = Date.now() - (duration - remaining) * 1000
+    root.phaseDurationSecs = duration
+    root.phasePausedSecondsLeft = 0
+    recomputeSeconds()
+    rescheduleTimers()
     saveState()
     broadcastStatus()
   }
 
   function reset() {
-    tickTimer.running = false
     root.phase = Model.PHASE_IDLE
-    root.secondsLeft = phaseSeconds(Model.PHASE_WORK)
+    root.phaseStartedAt = null
+    root.phaseDurationSecs = 0
+    root.phasePausedSecondsLeft = 0
     root.lastFiredWarningSeconds = []
+    recomputeSeconds()
+    rescheduleTimers()
     saveState()
     broadcastStatus()
   }
 
   function skip() {
-    // Move to the next phase immediately without recording history (the work
-    // block was not actually completed).
-    if (!Model.isRunningPhase(root.phase)) {
-      // If we were paused mid-WORK, treat as a skip from WORK.
-      if (root.phase === Model.PHASE_PAUSED) {
-        root.phase = Model.PHASE_WORK
-      } else {
-        return
-      }
-    }
-    var justFinished = root.phase
+    if (!Model.isRunningPhase(root.phase) && root.phase !== Model.PHASE_PAUSED) return
+    // Map PAUSED -> WORK so the nextPhase math is correct.
+    var justFinished = root.phase === Model.PHASE_PAUSED ? Model.PHASE_WORK : root.phase
     var next = Model.nextPhase(justFinished, root.completedWorkSessionsToday, root.settings)
-    tickTimer.running = false
     root.phase = next
-    root.secondsLeft = phaseSeconds(next)
+    root.phaseStartedAt = Date.now()
+    root.phaseDurationSecs = phaseSeconds(next)
+    root.phasePausedSecondsLeft = 0
     root.lastFiredWarningSeconds = []
+    recomputeSeconds()
     announcePhaseStart(next)
-    tickTimer.running = Model.isRunningPhase(next)
+    rescheduleTimers()
     saveState()
     broadcastStatus()
   }
@@ -208,58 +277,135 @@ Item {
     merged.autostartNext = !!merged.autostartNext
     if (!Array.isArray(merged.preWarningSeconds)) merged.preWarningSeconds = [120, 30]
     root.settings = merged
+
+    // If a phase is currently running, only `lastFiredWarningSeconds`
+    // depends on the previous duration. Re-evaluate pre-warnings against
+    // the new settings without restarting the phase.
+    var liveSeconds = recomputeSeconds()
+    maybeFirePreWarnings(liveSeconds, liveSeconds)
     saveState()
     broadcastStatus()
   }
 
   function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 
-  function inferPhaseFromSecondsLeft() {
-    // We don't persist the paused phase explicitly, but we can pick the
-    // closest one based on secondsLeft. This is good enough for the
-    // short-lived PAUSED state.
-    var s = root.secondsLeft
-    if (s === phaseSeconds(Model.PHASE_WORK)) return Model.PHASE_WORK
-    if (s === phaseSeconds(Model.PHASE_SHORT_BREAK)) return Model.PHASE_SHORT_BREAK
-    if (s === phaseSeconds(Model.PHASE_LONG_BREAK)) return Model.PHASE_LONG_BREAK
-    // Fall back: if it's close to work duration, treat as WORK.
-    if (s > phaseSeconds(Model.PHASE_LONG_BREAK)) return Model.PHASE_WORK
+  function inferPhaseFromPaused() {
+    // The duration tells us which phase we paused in. If for some reason
+    // we cannot infer, default to WORK — the most common case and the
+    // one the user will be resuming from.
+    var d = root.phaseDurationSecs
+    if (d === phaseSeconds(Model.PHASE_WORK)) return Model.PHASE_WORK
+    if (d === phaseSeconds(Model.PHASE_SHORT_BREAK)) return Model.PHASE_SHORT_BREAK
+    if (d === phaseSeconds(Model.PHASE_LONG_BREAK)) return Model.PHASE_LONG_BREAK
     return Model.PHASE_WORK
   }
 
-  // ---- Tick -----------------------------------------------------------------
+  // ---- Timer ladder ---------------------------------------------------------
 
+  // Slow tick — every 60 s while a phase is running. Recomputes
+  // secondsLeft and checks for pre-warning boundaries and phase end.
   Timer {
-    id: tickTimer
+    id: slowTick
+    interval: 60000
+    running: false
+    repeat: true
+    onTriggered: root.slowTickFired()
+  }
+
+  // Fast tick — every second while the popup is open or while we are
+  // within 60 s of phase end.
+  Timer {
+    id: fastTick
     interval: 1000
     running: false
     repeat: true
-    onTriggered: root.tick()
+    onTriggered: root.fastTickFired()
   }
 
-  function tick() {
-    if (!Model.isRunningPhase(root.phase)) return
-    root.secondsLeft = root.secondsLeft - 1
+  function rescheduleTimers() {
+    var running = Model.isRunningPhase(root.phase)
+    slowTick.running = running
+    if (!running) {
+      fastTick.running = false
+      return
+    }
+    var s = recomputeSeconds()
+    var needsFast = root.popupOpen || s <= 60
+    fastTick.running = needsFast
+  }
 
-    // Pre-warning notifications.
-    if (Model.shouldFirePreWarning(root.secondsLeft, root.settings.preWarningSeconds, root.lastFiredWarningSeconds)) {
-      // Only fire one notification per tick — pick the first matching second.
-      for (var i = 0; i < root.settings.preWarningSeconds.length; i++) {
-        var t = Number(root.settings.preWarningSeconds[i])
-        if (t === root.secondsLeft && root.lastFiredWarningSeconds.indexOf(t) === -1) {
-          root.lastFiredWarningSeconds = root.lastFiredWarningSeconds.concat([t])
+  function slowTickFired() {
+    if (!Model.isRunningPhase(root.phase)) {
+      slowTick.running = false
+      return
+    }
+    var s = recomputeSeconds()
+    // Pre-warning boundaries may have been crossed during the long sleep.
+    // We can't tell exactly which one fired, but we can check all of
+    // them against the *current* value — only seconds that equal a
+    // configured boundary and have not been announced yet will fire.
+    maybeFirePreWarnings(s, s)
+
+    // Promote to fast tick if we are now within the last minute — this
+    // gives the user a smooth transition from minute-precision to
+    // second-precision without waiting for the panel to open.
+    if (!fastTick.running && s <= 60) {
+      fastTick.running = true
+    }
+
+    if (s <= 0) {
+      finishPhase()
+    } else {
+      saveState()
+    }
+    broadcastStatus()
+  }
+
+  function fastTickFired() {
+    if (!Model.isRunningPhase(root.phase)) {
+      fastTick.running = false
+      return
+    }
+    var prev = root.secondsLeft
+    var s = recomputeSeconds()
+    // Detect any pre-warning seconds that the previous tick crossed
+    // through. This handles the case where the fast tick catches a
+    // boundary mid-second.
+    if (s !== prev && Model.shouldFirePreWarning(s, settings.preWarningSeconds, lastFiredWarningSeconds)) {
+      for (var i = 0; i < settings.preWarningSeconds.length; i++) {
+        var t = Number(settings.preWarningSeconds[i])
+        if (t === s && lastFiredWarningSeconds.indexOf(t) === -1) {
+          root.lastFiredWarningSeconds = lastFiredWarningSeconds.concat([t])
           notifyPreWarning(t)
           break
         }
       }
     }
 
-    if (root.secondsLeft <= 0) {
+    if (s <= 0) {
       finishPhase()
-    } else {
+    } else if (s % 10 === 0) {
+      // Save state every 10 s during the last-minute window — cheap and
+      // recovers cleanly from a shell restart in the final stretch.
       saveState()
     }
     broadcastStatus()
+  }
+
+  function maybeFirePreWarnings(currentSeconds, _ignored) {
+    // Walk the configured pre-warning seconds and fire any whose value
+    // equals `currentSeconds` and which we have not already announced in
+    // this phase. Used by slowTick where we may have skipped past
+    // several boundary crossings during one long sleep.
+    if (!settings || !Array.isArray(settings.preWarningSeconds)) return
+    for (var i = 0; i < settings.preWarningSeconds.length; i++) {
+      var t = Number(settings.preWarningSeconds[i])
+      if (!isFinite(t) || t < 0) continue
+      if (t === currentSeconds && lastFiredWarningSeconds.indexOf(t) === -1) {
+        root.lastFiredWarningSeconds = lastFiredWarningSeconds.concat([t])
+        notifyPreWarning(t)
+      }
+    }
   }
 
   function finishPhase() {
@@ -275,21 +421,21 @@ Item {
       root.completedWorkSessionsToday = root.completedWorkSessionsToday + 1
     }
     var next = Model.nextPhase(justFinished, root.completedWorkSessionsToday, root.settings)
-    tickTimer.running = false
     root.phase = next
-    root.secondsLeft = phaseSeconds(next)
+    root.phaseStartedAt = Date.now()
+    root.phaseDurationSecs = phaseSeconds(next)
+    root.phasePausedSecondsLeft = 0
     root.lastFiredWarningSeconds = []
 
     if (historyEntry) appendHistory(historyEntry)
     announcePhaseEnd(justFinished)
     announcePhaseStart(next)
 
-    // Autostart behaviour is opt-in; default off (ADHD: breaks the
-    // auto-cycle guilt trap).
-    if (root.settings.autostartNext && Model.isRunningPhase(next)) {
-      tickTimer.running = true
-    }
+    if (historyEntry) appendHistory(historyEntry)
+    recomputeSeconds()
+    rescheduleTimers()
     saveState()
+    broadcastStatus()
   }
 
   // ---- Notifications + sound ----------------------------------------------
@@ -335,11 +481,6 @@ Item {
   }
 
   // ---- Broadcast to bar widgets and panels --------------------------------
-  //
-  // Both `phase`, `secondsLeft`, and friends are reactive QML properties, so
-  // any widget bound to them re-renders automatically on tick. The
-  // broadcastStatus() call here exists so an external caller can explicitly
-  // ask for a refresh (e.g. after IPC start) without waiting for a tick.
 
   function broadcastStatus() {
     // No-op today: reactive properties already drive widgets. Kept as an
@@ -378,6 +519,7 @@ Item {
     }
 
     function status(): var {
+      root.recomputeSeconds()
       return {
         phase: root.phase,
         secondsLeft: root.secondsLeft,
@@ -411,6 +553,7 @@ Item {
         try { root.shell.toggle("abdullah.adhd-pomodoro") } catch (e) { /* ignored */ }
       }
     }
+    function setPanelOpen(open: bool): void { root.setPopupOpen(open) }
   }
 
   // ---- Process for directory bootstrap -------------------------------------
@@ -420,12 +563,12 @@ Item {
     onExited: {
       stateFile.reload()
       historyFile.reload()
-      broadcastStatus()
     }
   }
 
   Component.onDestruction: {
-    tickTimer.running = false
+    slowTick.running = false
+    fastTick.running = false
     saveState()
   }
 }

@@ -13,7 +13,13 @@ per-day session log.
   Skip, a task label input, today's progress toward the daily goal, a
   list of completed sessions today, and a settings drawer.
 - Persistent state in `~/.local/state/abdullah.adhd-pomodoro/state.json`
-  and an append-only session history in `history.jsonl`.
+  and an append-only session history in `history.jsonl`. The state file
+  stores `phaseStartedAt` (epoch ms) and `phaseDurationSecs`; the
+  countdown is derived from the wall clock, so a shell restart mid-focus
+  resumes at the correct second. A running phase keeps a single 60-second
+  timer while the popup is closed and more than a minute remains; a
+  per-second tick kicks in when the popup opens or within 60 s of phase
+  end. IDLE / PAUSED use no timers at all.
 - IPC routes on `abdullah.adhd-pomodoro` so a future CLI helper or
   keybinding can drive the same timer.
 
