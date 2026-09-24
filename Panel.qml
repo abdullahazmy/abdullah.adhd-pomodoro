@@ -27,13 +27,31 @@ Panel {
   property var service: null
 
   // ---- Live mirrors of the service state ----------------------------------
+  // Each mirror points at the service's reactive property directly. Going
+  // through a `var` intermediate (the earlier `readonly property var
+  // settings`) breaks member-property change notifications, so bindings
+  // like `checked: settings.soundOnPhaseEnd` would freeze on the first
+  // value they saw and never re-evaluate when the service reassigned
+  // its settings object. Binding straight to `service.settings.foo` keeps
+  // the dependency chain on a real Q_PROPERTY.
   readonly property string phase: service ? service.phase : Model.PHASE_IDLE
   readonly property int secondsLeft: service ? service.secondsLeft : 0
   readonly property string taskLabel: service ? (service.taskLabel || "") : ""
   readonly property int completedToday: service ? service.completedWorkSessionsToday : 0
   readonly property var settings: service ? service.settings : Model.defaultSettings()
-  readonly property int dailyGoal: settings.dailyGoal
+  readonly property int dailyGoal: service ? service.settings.dailyGoal : 8
+  readonly property bool soundOnPhaseEnd: service ? service.settings.soundOnPhaseEnd : true
+  readonly property bool autostartNext: service ? service.settings.autostartNext : false
+  readonly property int workMinutes: service ? service.settings.workMinutes : 25
+  readonly property int shortBreakMinutes: service ? service.settings.shortBreakMinutes : 5
+  readonly property int longBreakMinutes: service ? service.settings.longBreakMinutes : 15
+  readonly property int longBreakInterval: service ? service.settings.longBreakInterval : 4
+  readonly property var preWarningSeconds: service ? service.settings.preWarningSeconds : [120, 30]
 
+  // Seconds-precision MM:SS readout. The wall-clock-based service does
+  // not tick at 1 Hz while the popup is closed; this binding re-evaluates
+  // once a minute via the slow tick, then per second once the popup opens
+  // or we are within 60 s of phase end.
   readonly property string mmss: Model.formatMMSS(secondsLeft)
   readonly property string phaseLabel: Model.phaseLabel(phase)
   readonly property string phaseGlyph: Model.phaseGlyph(phase)
@@ -432,61 +450,61 @@ Panel {
         NumberField {
           width: parent.width
           label: "Focus minutes"
-          value: root.settings.workMinutes
+          value: root.workMinutes
           from: 1
           to: 180
           stepSize: 1
           foreground: root.bar.foreground
           fontFamily: root.bar.fontFamily
-          onModified: if (value !== root.settings.workMinutes) root.updateSetting("workMinutes", value)
+          onModified: if (value !== root.workMinutes) root.updateSetting("workMinutes", value)
         }
 
         NumberField {
           width: parent.width
           label: "Short break minutes"
-          value: root.settings.shortBreakMinutes
+          value: root.shortBreakMinutes
           from: 1
           to: 60
           stepSize: 1
           foreground: root.bar.foreground
           fontFamily: root.bar.fontFamily
-          onModified: if (value !== root.settings.shortBreakMinutes) root.updateSetting("shortBreakMinutes", value)
+          onModified: if (value !== root.shortBreakMinutes) root.updateSetting("shortBreakMinutes", value)
         }
 
         NumberField {
           width: parent.width
           label: "Long break minutes"
-          value: root.settings.longBreakMinutes
+          value: root.longBreakMinutes
           from: 1
           to: 90
           stepSize: 1
           foreground: root.bar.foreground
           fontFamily: root.bar.fontFamily
-          onModified: if (value !== root.settings.longBreakMinutes) root.updateSetting("longBreakMinutes", value)
+          onModified: if (value !== root.longBreakMinutes) root.updateSetting("longBreakMinutes", value)
         }
 
         NumberField {
           width: parent.width
           label: "Long break every N work sessions"
-          value: root.settings.longBreakInterval
+          value: root.longBreakInterval
           from: 2
           to: 12
           stepSize: 1
           foreground: root.bar.foreground
           fontFamily: root.bar.fontFamily
-          onModified: if (value !== root.settings.longBreakInterval) root.updateSetting("longBreakInterval", value)
+          onModified: if (value !== root.longBreakInterval) root.updateSetting("longBreakInterval", value)
         }
 
         NumberField {
           width: parent.width
           label: "Daily goal (pomodoros)"
-          value: root.settings.dailyGoal
+          value: root.dailyGoal
           from: 1
           to: 30
           stepSize: 1
           foreground: root.bar.foreground
           fontFamily: root.bar.fontFamily
-          onModified: if (value !== root.settings.dailyGoal) root.updateSetting("dailyGoal", value)
+          onModified: if (value !== root.dailyGoal) root.updateSetting("dailyGoal", value)
         }
 
         Column {
@@ -504,7 +522,7 @@ Panel {
           TextField {
             id: preWarningField
             width: parent.width
-            text: root.settings.preWarningSeconds.join(", ")
+            text: root.preWarningSeconds.join(", ")
             placeholderText: "e.g. 120, 30"
             color: root.bar.foreground
             font.family: root.bar.fontFamily
@@ -531,12 +549,16 @@ Panel {
 
           ToggleSwitch {
             id: soundToggle
-            checked: root.settings.soundOnPhaseEnd
+            // Bind to the panel's mirror property so QML tracks the
+            // change; `root.settings.soundOnPhaseEnd` (going through the
+            // `var` settings alias above) freezes on first evaluation.
+            checked: root.soundOnPhaseEnd
             foreground: root.bar.foreground
             interactive: true
-            // The Text label is also clickable; clicking anywhere in the row
-            // toggles the switch so the affordance is generous.
-            onToggled: root.updateSetting("soundOnPhaseEnd", checked)
+            // ToggleSwitch's MouseArea fires `toggled()` but does NOT flip
+            // its own `checked` — the consumer has to. The toggle reads
+            // the previous value here, so flip it explicitly.
+            onToggled: root.updateSetting("soundOnPhaseEnd", !checked)
             anchors.verticalCenter: parent.verticalCenter
           }
           Text {
@@ -546,11 +568,6 @@ Panel {
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
             anchors.verticalCenter: parent.verticalCenter
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: soundToggle.checked = !soundToggle.checked
-            }
           }
         }
 
@@ -561,10 +578,11 @@ Panel {
 
           ToggleSwitch {
             id: autostartToggle
-            checked: root.settings.autostartNext
+            // Same mirror-property pattern as the sound toggle above.
+            checked: root.autostartNext
             foreground: root.bar.foreground
             interactive: true
-            onToggled: root.updateSetting("autostartNext", checked)
+            onToggled: root.updateSetting("autostartNext", !checked)
             anchors.verticalCenter: parent.verticalCenter
           }
           Text {
@@ -574,11 +592,6 @@ Panel {
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
             anchors.verticalCenter: parent.verticalCenter
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: autostartToggle.checked = !autostartToggle.checked
-            }
           }
         }
       }

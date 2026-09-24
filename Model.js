@@ -74,6 +74,25 @@ function formatMMSS(totalSeconds) {
   return (m < 10 ? "0" : "") + m + ":" + (r < 10 ? "0" : "") + r;
 }
 
+// "Minutes enough" formatter used by the bar widget and popup hero:
+// more than a minute left -> "25m" (round up so the bar never reads
+// "0m" while a phase is still running); the final minute switches to
+// "0:42" so the user can see the last seconds precisely.
+function formatCoarse(totalSeconds) {
+  var s = Math.max(0, Math.floor(totalSeconds || 0));
+  if (s > 60) {
+    // Round up — "25m" through "24:01" reads as "25m". This matches the
+    // way the user thinks about the timer ("about 25 minutes, almost
+    // done is still 25 minutes") and avoids a confusing flicker to
+    // "24m" the instant the phase crosses the minute boundary.
+    return Math.ceil(s / 60) + "m";
+  }
+  // Last minute — drop the leading "0:" and show seconds.
+  var m = Math.floor(s / 60);
+  var r = s % 60;
+  return m + ":" + (r < 10 ? "0" + r : r);
+}
+
 // ---------- Timing math -----------------------------------------------------
 
 // Compute secondsLeft for a running phase from `phaseStartedAt` and the

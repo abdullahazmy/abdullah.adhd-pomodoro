@@ -42,6 +42,9 @@ BarWidget {
 
   // Visual constants
   readonly property string glyph: Model.phaseGlyph(phase)
+  // Seconds-precision MM:SS readout. The wall-clock-based service still
+  // does NOT tick at 1 Hz while the popup is closed — the bar updates at
+  // most once a minute until the last 60 s of a phase, then per second.
   readonly property string mmss: Model.formatMMSS(secondsLeft)
   // The last 30 s of a focus block: pulse the bar label so the user notices
   // even when they have drifted to a different window.

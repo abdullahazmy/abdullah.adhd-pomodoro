@@ -12,3 +12,4 @@
 
 # Local Quickshell logs (when the plugin is run from this checkout)
 *.qslog
+REPLY_TO_REVIEWER.md
