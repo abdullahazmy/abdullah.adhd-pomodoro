@@ -66,7 +66,27 @@ Panel {
   property bool settingsOpen: false
 
   // ---- Today's history (lazy-loaded) -------------------------------------
+  // history.jsonl is read by the service through a bounded Process (see
+  // PomodoroService.qml historyReadProc). We do NOT load it here via a
+  // FileView, since the file grows forever and an unbounded read on the
+  // popup would balloon the shared shell's memory.
   property var todayEntries: []
+  // Recompute todayEntries whenever the service refreshes its bounded
+  // history read. The service exposes the bounded text as
+  // `pendingHistoryText` and a `historyChanged` signal.
+  function recomputeTodayEntries() {
+    if (!root.service) {
+      root.todayEntries = []
+      return
+    }
+    var entries = Model.parseHistoryFile(root.service.pendingHistoryText || "")
+    root.todayEntries = Model.todayHistoryEntries(entries)
+  }
+  Connections {
+    target: root.service
+    function onHistoryChanged() { root.recomputeTodayEntries() }
+    function onPendingHistoryTextChanged() { root.recomputeTodayEntries() }
+  }
   // Hide the entire SESSIONS list by default on days with many sessions,
   // so the Settings drawer is always reachable. Toggle "Show sessions
   // list" in the drawer to bring it back. Light days still show the list
@@ -76,30 +96,14 @@ Panel {
   readonly property bool sessionsListWouldOverflow:
     todayEntries.length > sessionsCollapseThreshold
   property bool sessionsHidden: false
-  property string historyPath: (Quickshell.env("HOME") || "") + "/.local/state/abdullah.adhd-pomodoro/history.jsonl"
 
-  FileView {
-    id: historyFile
-    path: root.historyPath
-    watchChanges: true
-    atomicWrites: false
-    printErrors: false
-    onLoaded: root.reloadHistory()
-    onLoadFailed: root.todayEntries = []
-    onFileChanged: reload()
-  }
-
-  Timer {
-    id: historyRefreshTimer
-    interval: 750
-    repeat: false
-    onTriggered: historyFile.reload()
-  }
-
-  // Whenever the panel becomes visible, re-read the history file. Cheap
-  // because the file is small (one JSON line per completed WORK session).
+  // Whenever the panel becomes visible, ask the service to refresh its
+  // bounded history read. The result lands in service.pendingHistoryText,
+  // which we recompute todayEntries from.
   onOpenedChanged: if (opened) {
-    historyFile.reload()
+    if (root.service && typeof root.service.refreshHistory === "function") {
+      root.service.refreshHistory()
+    }
     // Reseed the task field from the service and grab focus so the user
     // can immediately start typing or editing.
     Qt.callLater(function() {
@@ -109,8 +113,9 @@ Panel {
   }
 
   function reloadHistory() {
-    var entries = Model.parseHistoryFile(historyFile.text())
-    root.todayEntries = Model.todayHistoryEntries(entries)
+    if (root.service && typeof root.service.refreshHistory === "function") {
+      root.service.refreshHistory()
+    }
   }
 
   // ---- Actions ------------------------------------------------------------

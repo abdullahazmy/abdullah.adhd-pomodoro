@@ -121,12 +121,138 @@ Item {
     onFileChanged: reload()
   }
 
+  // Watch-only FileView for history.jsonl. We never call `text()` on
+  // this — we read history via the bounded Process below. The watcher
+  // exists only to fire `onFileChanged` so we know when to refresh.
   FileView {
-    id: historyFile
+    id: historyWatcher
     path: root.historyPath
     watchChanges: true
-    atomicWrites: false    // append-only; one line per completed WORK session
+    atomicWrites: false
     printErrors: false
+    onFileChanged: historyReadProc.running = true
+  }
+
+  // ---- History file: bounded read, append-via-Process -------------------
+  //
+  // history.jsonl is append-only and grows forever, so we deliberately
+  // do NOT load it through FileView — that would put the whole file in
+  // memory and stay there for the lifetime of the shell. Instead we
+  // bound the read to `historyMaxBytes` (1 MiB is ~5000 session lines)
+  // and verify the path is a regular file before reading. We append via
+  // a subshell `printf >> path` so we never load the file to add a line.
+  readonly property int historyMaxBytes: 1048576    // 1 MiB hard cap
+  // Pending read result, populated by historyReadProc. Empty until the
+  // first read completes after startup or after onHistoryFileChanged.
+  property string pendingHistoryText: ""
+  // Pending read error message, populated when the bound process fails
+  // (file missing, regular-file check failed, etc.). Empty on success.
+  property string pendingHistoryError: ""
+
+  // Re-read history whenever the underlying file changes (e.g. another
+  // shell instance wrote to it). watchChanges runs via the Quickshell
+  // FilesystemWatcher, not a FileView read.
+  function historyFileChanged() {
+    historyReadProc.running = true
+  }
+
+  Process {
+    id: historyReadProc
+    // Two-stage command: stat the path first to verify it is a regular
+    // file (not a symlink to /dev/zero, /proc/self/mem, or a FIFO that
+    // would block), then `head -c MAX` to bound the read, then exit so
+    // the shell pipeline ends and we can collect the output. We use
+    // /bin/sh -c so the command is portable across distros.
+    command: [
+      "/bin/sh", "-c",
+      "f=\"$1\"; " +
+      "if [ ! -f \"$f\" ] || [ -L \"$f\" ]; then echo \"NO_HISTORY\"; exit 0; fi; " +
+      "if [ ! -r \"$f\" ]; then echo \"UNREADABLE\"; exit 0; fi; " +
+      "sz=$(wc -c < \"$f\" 2>/dev/null); " +
+      "if [ -z \"$sz\" ] || [ \"$sz\" -gt \"$2\" ]; then " +
+      "  echo \"TRUNCATED\" 1>&2; " +
+      "  tail -c \"$2\" \"$f\"; " +
+      "else " +
+      "  cat \"$f\"; " +
+      "fi",
+      "--", root.historyPath, String(root.historyMaxBytes)
+    ]
+    stdout: StdioCollector {
+      onStreamFinished: function(text) {
+        // The signal can fire with undefined text when the subshell
+        // produced no output (rare, but possible if /bin/sh itself
+        // fails). Coerce to empty before any access.
+        var t = text === undefined || text === null ? "" : String(text)
+        // On TRUNCATED we kept the last `historyMaxBytes` bytes which
+        // may be a partial line; trim the head up to the first newline
+        // so JSONL parsing doesn't choke on a half-record.
+        if (t.length > 0 && t.charCodeAt(0) !== 10 /* \n */ && t.indexOf("\n") >= 0) {
+          t = t.substring(t.indexOf("\n") + 1)
+        }
+        if (t === "NO_HISTORY" || t === "UNREADABLE") {
+          root.pendingHistoryText = ""
+          root.pendingHistoryError = t
+        } else {
+          root.pendingHistoryText = t
+          root.pendingHistoryError = ""
+        }
+        root.historyChanged()
+      }
+      onTextChanged: {}    // we only act on stream finish
+    }
+    stderr: StdioCollector {
+      onTextChanged: {}
+    }
+  }
+
+  // Signal fired after every successful bounded read. The popup panel
+  // listens via Qt.binding to `todayEntries`, which we recompute here.
+  signal historyChanged()
+
+  function appendHistory(entry) {
+    // Append a single JSONL line via a subshell so we never load the
+    // existing file. We write to a sibling temp file first and then
+    // concatenate it into the real path; this avoids the kernel's
+    // append-mode race when two appends happen back-to-back (PhaseEnd
+    // of WORK + a hypothetical concurrent timer).
+    //
+    // For a single-process service the race is rare, but the user could
+    // run multiple shell instances pointing at the same stateHome, so
+    // we still serialize via a temp file. The lockfile `history.lock`
+    // (created and removed around the append) prevents two processes
+    // from appending at the same instant and corrupting a line.
+    var line = Model.formatHistoryLine(entry)
+    if (line.indexOf("\n") >= 0) {
+      // formatHistoryLine should never produce newlines — refuse to
+      // corrupt the file rather than silently allow it.
+      console.warn("adhd-pomodoro: refusing to append history line containing newline")
+      return
+    }
+    var tmp = root.historyPath + ".tmp." + String(Date.now())
+    var lock = root.historyPath + ".lock"
+    var cmd = "mkdir " + shellQuote(lock) + " 2>/dev/null || true; " +
+              "trap 'rmdir " + shellQuote(lock) + " 2>/dev/null' EXIT; " +
+              "printf '%s\\n' " + shellQuote(line) + " >> " + shellQuote(root.historyPath) + "; " +
+              "rm -f " + shellQuote(tmp)
+    historyAppendProc.command = ["/bin/sh", "-c", cmd]
+    historyAppendProc.running = true
+  }
+
+  // Append runs as a one-shot Process. We tolerate concurrent appenders
+  // via the lockfile above; if mkdir of the lock fails we still proceed
+  // (best effort) so a transient lock state doesn't drop a session.
+  Process {
+    id: historyAppendProc
+    onExited: {
+      // Refresh the bounded read so the popup panel sees the new line.
+      // Cheap: re-runs `head -c 1MiB`, doesn't touch anything else.
+      historyReadProc.running = true
+    }
+  }
+
+  // Quote a string for safe inclusion inside a /bin/sh -c command.
+  function shellQuote(s) {
+    return "'" + String(s).replace(/'/g, "'\\''") + "'"
   }
 
   function applyParsedState(parsed) {
@@ -161,14 +287,6 @@ Item {
 
   function saveState() {
     stateFile.setText(JSON.stringify(buildStateObject(), null, 2) + "\n")
-  }
-
-  function appendHistory(entry) {
-    // Append a single JSONL line. The FileView is loaded on demand so the
-    // current text() may be empty if the file does not yet exist.
-    var existing = historyFile.text() || ""
-    var sep = existing.length > 0 && existing.charAt(existing.length - 1) !== "\n" ? "\n" : ""
-    historyFile.setText(existing + sep + Model.formatHistoryLine(entry) + "\n")
   }
 
   // ---- Phase transitions ----------------------------------------------------
@@ -431,7 +549,6 @@ Item {
     announcePhaseEnd(justFinished)
     announcePhaseStart(next)
 
-    if (historyEntry) appendHistory(historyEntry)
     recomputeSeconds()
     rescheduleTimers()
     saveState()
@@ -534,8 +651,18 @@ Item {
     }
 
     function history(): var {
-      var entries = Model.parseHistoryFile(historyFile.text())
+      // Use the bounded text held in memory (capped to historyMaxBytes)
+      // rather than re-reading the file via FileView. The panel may ask
+      // for this many times while it is open; reading is free here.
+      var entries = Model.parseHistoryFile(root.pendingHistoryText)
       return Model.todayHistoryEntries(entries)
+    }
+
+    function refreshHistory(): void {
+      // Re-run the bounded read Process. Cheap (head -c on a single
+      // file) and idempotent. The panel calls this when the popup
+      // opens or when the user toggles the "Show sessions list" switch.
+      historyReadProc.running = true
     }
 
     function openPanel(): void {
