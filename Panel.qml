@@ -22,6 +22,8 @@ Panel {
   manageIpc: false    // The service owns the IPC handler so callers
                       // (bar widget, future CLI) reach the same methods.
 
+  Component.onCompleted: {}
+
   property var anchorItem: null
   property var hostWidget: null
   property var service: null
