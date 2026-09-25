@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "abdullah.adhd-pomodoro",
   "name": "ADHD Pomodoro",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "author": "abdullah",
   "license": "MIT",
   "description": "ADHD-friendly Pomodoro timer: visible countdown in the bar, gentle pre-warnings, plain-text task labels, and a per-day session log.",

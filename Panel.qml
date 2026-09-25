@@ -65,14 +65,15 @@ Panel {
 
   // ---- Today's history (lazy-loaded) -------------------------------------
   property var todayEntries: []
-  // Cap the visible list at a comfortable default; the user can expand
-  // it inline when they want to scroll back further. Without this, a day
-  // with many sessions pushes the Settings drawer below the fold.
-  property int sessionsCollapsedLimit: 6
-  property bool showAllSessions: false
-  readonly property var visibleEntries: showAllSessions
-    ? todayEntries
-    : todayEntries.slice(0, sessionsCollapsedLimit)
+  // Hide the entire SESSIONS list by default on days with many sessions,
+  // so the Settings drawer is always reachable. Toggle "Show sessions
+  // list" in the drawer to bring it back. Light days still show the list
+  // automatically — the toggle only hides when there are enough entries
+  // that the list would push settings below the fold.
+  property int sessionsCollapseThreshold: 6
+  readonly property bool sessionsListWouldOverflow:
+    todayEntries.length > sessionsCollapseThreshold
+  property bool sessionsHidden: false
   property string historyPath: (Quickshell.env("HOME") || "") + "/.local/state/abdullah.adhd-pomodoro/history.jsonl"
 
   FileView {
@@ -378,58 +379,26 @@ Panel {
       }
 
       // ---- Today's session log -----------------------------------------
+      // The list is hidden when the user opts out via the settings drawer.
+      // The TODAY header always shows the current count so the user can
+      // still see their progress without having to open the list.
       Column {
         width: parent.width
         spacing: Style.space(4)
-        visible: root.todayEntries.length > 0
+        visible: root.todayEntries.length > 0 && !root.sessionsHidden
 
-        Row {
-          width: parent.width
-          spacing: Style.space(8)
-
-          Text {
-            textFormat: Text.PlainText
-            text: "SESSIONS"
-            color: Qt.darker(root.bar.foreground, 1.3)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-            font.bold: true
-            font.letterSpacing: 1.2
-            anchors.verticalCenter: parent.verticalCenter
-          }
-
-          // "Show all" / "Show less" affordance. Hidden when there are
-          // fewer sessions than the collapsed limit so the popup stays
-          // uncluttered on light days.
-          Item {
-            visible: root.todayEntries.length > root.sessionsCollapsedLimit
-            anchors.verticalCenter: parent.verticalCenter
-            width: visible ? showMoreLabel.implicitWidth + Style.space(8) : 0
-            height: Style.space(20)
-
-            Text {
-              id: showMoreLabel
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              textFormat: Text.PlainText
-              text: root.showAllSessions
-                ? ("Show less (" + root.todayEntries.length + ")")
-                : ("Show all (" + root.todayEntries.length + ")")
-              color: Color.accent
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              font.bold: true
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.showAllSessions = !root.showAllSessions
-              }
-            }
-          }
+        Text {
+          textFormat: Text.PlainText
+          text: "SESSIONS"
+          color: Qt.darker(root.bar.foreground, 1.3)
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+          font.letterSpacing: 1.2
         }
 
         Repeater {
-          model: root.visibleEntries
+          model: root.todayEntries
           Row {
             required property var modelData
             width: parent.width
@@ -631,6 +600,39 @@ Panel {
           Text {
             textFormat: Text.PlainText
             text: "Auto-start next phase"
+            color: root.bar.foreground
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            anchors.verticalCenter: parent.verticalCenter
+          }
+        }
+
+        Row {
+          width: parent.width
+          spacing: Style.space(8)
+
+          ToggleSwitch {
+            id: sessionsHiddenToggle
+            // Bind to a `bool` mirror so the toggle's visual state tracks
+            // the panel property directly (no `var` intermediate that
+            // would freeze on first evaluation). `checked: !sessionsHidden`
+            // because the toggle shows "Show sessions list" — checked
+            // means the list is visible.
+            checked: !root.sessionsHidden
+            foreground: root.bar.foreground
+            interactive: true
+            // ToggleSwitch's MouseArea fires `toggled()` without flipping
+            // its own `checked`. We toggle the underlying bool directly:
+            // `sessionsHidden` starts at whatever the current value is,
+            // and the new value is the negation.
+            onToggled: root.sessionsHidden = !root.sessionsHidden
+            anchors.verticalCenter: parent.verticalCenter
+          }
+          Text {
+            textFormat: Text.PlainText
+            // Show the current count in the label so the user can tell
+            // what they're hiding without opening the list first.
+            text: "Show sessions list (" + root.todayEntries.length + ")"
             color: root.bar.foreground
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
