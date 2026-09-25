@@ -65,6 +65,14 @@ Panel {
 
   // ---- Today's history (lazy-loaded) -------------------------------------
   property var todayEntries: []
+  // Cap the visible list at a comfortable default; the user can expand
+  // it inline when they want to scroll back further. Without this, a day
+  // with many sessions pushes the Settings drawer below the fold.
+  property int sessionsCollapsedLimit: 6
+  property bool showAllSessions: false
+  readonly property var visibleEntries: showAllSessions
+    ? todayEntries
+    : todayEntries.slice(0, sessionsCollapsedLimit)
   property string historyPath: (Quickshell.env("HOME") || "") + "/.local/state/abdullah.adhd-pomodoro/history.jsonl"
 
   FileView {
@@ -375,18 +383,53 @@ Panel {
         spacing: Style.space(4)
         visible: root.todayEntries.length > 0
 
-        Text {
-          textFormat: Text.PlainText
-          text: "SESSIONS"
-          color: Qt.darker(root.bar.foreground, 1.3)
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.caption
-          font.bold: true
-          font.letterSpacing: 1.2
+        Row {
+          width: parent.width
+          spacing: Style.space(8)
+
+          Text {
+            textFormat: Text.PlainText
+            text: "SESSIONS"
+            color: Qt.darker(root.bar.foreground, 1.3)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 1.2
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          // "Show all" / "Show less" affordance. Hidden when there are
+          // fewer sessions than the collapsed limit so the popup stays
+          // uncluttered on light days.
+          Item {
+            visible: root.todayEntries.length > root.sessionsCollapsedLimit
+            anchors.verticalCenter: parent.verticalCenter
+            width: visible ? showMoreLabel.implicitWidth + Style.space(8) : 0
+            height: Style.space(20)
+
+            Text {
+              id: showMoreLabel
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: root.showAllSessions
+                ? ("Show less (" + root.todayEntries.length + ")")
+                : ("Show all (" + root.todayEntries.length + ")")
+              color: Color.accent
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.showAllSessions = !root.showAllSessions
+              }
+            }
+          }
         }
 
         Repeater {
-          model: root.todayEntries
+          model: root.visibleEntries
           Row {
             required property var modelData
             width: parent.width
