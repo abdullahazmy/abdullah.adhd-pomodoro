@@ -9,6 +9,7 @@
 # Build / cache artifacts
 *.qmlls.ini
 .qmllint.ini
+bin/__pycache__
 
 # Local Quickshell logs (when the plugin is run from this checkout)
 *.qslog

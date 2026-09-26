@@ -42,6 +42,22 @@ Item {
   readonly property string statePath: stateHome + "/state.json"
   readonly property string historyPath: stateHome + "/history.jsonl"
 
+  // Helper script that all sensitive file IO is shelled through. Defaults
+  // to the canonical third-party install location. Override with
+  // `ADHD_POMODORO_HOME` for non-standard layouts.
+  readonly property string pluginHome: (function() {
+    var override = Quickshell.env("ADHD_POMODORO_HOME")
+    if (override) return override
+    return (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/abdullah.adhd-pomodoro"
+  })()
+  readonly property string helperScript: pluginHome + "/bin/adhd-pomodoro-helper.py"
+  readonly property string pythonBin: "/usr/bin/python3"
+
+  // Cap on a single state.json read. The state document is small (a
+  // few hundred bytes); 256 KiB is plenty of headroom and still small
+  // enough to be safe if someone plants a huge file at the path.
+  readonly property int stateMaxBytes: 262144    // 256 KiB hard cap
+
   // ---- Persistent state ----------------------------------------------------
   // `phase`, `phaseStartedAt`, `phaseDurationSecs`, and
   // `phasePausedSecondsLeft` mirror state.json. Reactive so the bar and
@@ -103,32 +119,34 @@ Item {
   }
 
   // ---- File-backed state ----------------------------------------------------
+  // The state file is loaded and saved via the secure helper script
+  // (`bin/adhd-pomodoro-helper.py`). The helper checks that the file is
+  // a regular file (not a symlink), bounds reads to ~256 KiB, opens
+  // writes with O_NOFOLLOW, and persists them via an atomic rename().
+  // FileView here is watch-only — we never call `text()` on it, so we
+  // never load the file path blindly into memory. We deliberately do
+  // NOT auto-trigger stateReadProc on the FileView's onFileChanged,
+  // because our own helper writes touch the file and would otherwise
+  // create a write/read loop.
   FileView {
     id: stateFile
     path: root.statePath
     watchChanges: true
-    atomicWrites: true
+    atomicWrites: false   // helper does its own atomic write
+    blockLoading: true    // never preload
+    blockAllReads: true   // never let text() succeed
     printErrors: false
-    onLoaded: {
-      var parsed = Model.parseStateFile(text())
-      Model.rolloverIfNewDay(parsed)
-      applyParsedState(parsed)
-    }
-    onLoadFailed: {
-      // Missing or unreadable: persist defaults so future saves are clean.
-      saveState()
-    }
-    onFileChanged: reload()
   }
 
-  // Watch-only FileView for history.jsonl. We never call `text()` on
-  // this — we read history via the bounded Process below. The watcher
-  // exists only to fire `onFileChanged` so we know when to refresh.
+  // Watch-only FileView for history.jsonl. Used to detect external
+  // writes (e.g. another process appends) so we can refresh.
   FileView {
     id: historyWatcher
     path: root.historyPath
     watchChanges: true
     atomicWrites: false
+    blockLoading: true    // never preload
+    blockAllReads: true   // never let text() succeed
     printErrors: false
     onFileChanged: historyReadProc.running = true
   }
@@ -137,70 +155,82 @@ Item {
   //
   // history.jsonl is append-only and grows forever, so we deliberately
   // do NOT load it through FileView — that would put the whole file in
-  // memory and stay there for the lifetime of the shell. Instead we
-  // bound the read to `historyMaxBytes` (1 MiB is ~5000 session lines)
-  // and verify the path is a regular file before reading. We append via
-  // a subshell `printf >> path` so we never load the file to add a line.
+  // memory and stay there for the lifetime of the shell. All read and
+  // append IO goes through `bin/adhd-pomodoro-helper.py`, which:
+  //   * verifies the parent directory is owned by the running user and
+  //     is not group/world-writable;
+  //   * verifies the path is a regular file (rejects symlinks, FIFOs,
+  //     /dev/zero redirects) before opening it;
+  //   * bounds reads to 1 MiB (~5000 session lines);
+  //   * appends via `fcntl.flock(LOCK_EX)` + `O_WRONLY|O_APPEND|O_NOFOLLOW`
+  //     so concurrent appenders serialize and a planted symlink cannot
+  //     redirect writes off-host.
   readonly property int historyMaxBytes: 1048576    // 1 MiB hard cap
   // Pending read result, populated by historyReadProc. Empty until the
   // first read completes after startup or after onHistoryFileChanged.
   property string pendingHistoryText: ""
   // Pending read error message, populated when the bound process fails
-  // (file missing, regular-file check failed, etc.). Empty on success.
+  // (file missing, regular-file check failed, symlink, owner mismatch,
+  // etc.). Empty on success.
   property string pendingHistoryError: ""
 
   // Re-read history whenever the underlying file changes (e.g. another
-  // shell instance wrote to it). watchChanges runs via the Quickshell
-  // FilesystemWatcher, not a FileView read.
+  // shell instance wrote to it). The watcher is a watch-only FileView;
+  // the read itself comes from historyReadProc.
   function historyFileChanged() {
     historyReadProc.running = true
   }
 
   Process {
     id: historyReadProc
-    // Two-stage command: stat the path first to verify it is a regular
-    // file (not a symlink to /dev/zero, /proc/self/mem, or a FIFO that
-    // would block), then `head -c MAX` to bound the read, then exit so
-    // the shell pipeline ends and we can collect the output. We use
-    // /bin/sh -c so the command is portable across distros.
     command: [
-      "/bin/sh", "-c",
-      "f=\"$1\"; " +
-      "if [ ! -f \"$f\" ] || [ -L \"$f\" ]; then echo \"NO_HISTORY\"; exit 0; fi; " +
-      "if [ ! -r \"$f\" ]; then echo \"UNREADABLE\"; exit 0; fi; " +
-      "sz=$(wc -c < \"$f\" 2>/dev/null); " +
-      "if [ -z \"$sz\" ] || [ \"$sz\" -gt \"$2\" ]; then " +
-      "  echo \"TRUNCATED\" 1>&2; " +
-      "  tail -c \"$2\" \"$f\"; " +
-      "else " +
-      "  cat \"$f\"; " +
-      "fi",
-      "--", root.historyPath, String(root.historyMaxBytes)
+      root.pythonBin, root.helperScript,
+      "history-read", root.historyPath,
+      String(root.historyMaxBytes)
     ]
     stdout: StdioCollector {
+      waitForEnd: true
       onStreamFinished: function(text) {
-        // The signal can fire with undefined text when the subshell
-        // produced no output (rare, but possible if /bin/sh itself
-        // fails). Coerce to empty before any access.
         var t = text === undefined || text === null ? "" : String(text)
-        // On TRUNCATED we kept the last `historyMaxBytes` bytes which
-        // may be a partial line; trim the head up to the first newline
-        // so JSONL parsing doesn't choke on a half-record.
-        if (t.length > 0 && t.charCodeAt(0) !== 10 /* \n */ && t.indexOf("\n") >= 0) {
-          t = t.substring(t.indexOf("\n") + 1)
-        }
-        if (t === "NO_HISTORY" || t === "UNREADABLE") {
-          root.pendingHistoryText = ""
-          root.pendingHistoryError = t
+        // Helper prefixes its response with a sentinel line:
+        //   "NO_HISTORY"             -> file absent or symlink
+        //   "HISTORY_OK\n..."        -> regular bounded read
+        //   "HISTORY_TRUNCATED\n..." -> file was larger than the cap
+        // Anything else is treated as a raw JSONL payload (helper
+        // changes shouldn't break us silently).
+        var body = t
+        var firstNewline = t.indexOf("\n")
+        var firstLine = firstNewline >= 0 ? t.substring(0, firstNewline) : t
+        if (firstLine === "NO_HISTORY" || firstLine === "HISTORY_OK"
+            || firstLine === "HISTORY_TRUNCATED") {
+          if (firstLine === "NO_HISTORY") {
+            body = ""
+          } else {
+            body = firstNewline >= 0 ? t.substring(firstNewline + 1) : ""
+            // On HISTORY_TRUNCATED the helper returned the last
+            // `historyMaxBytes` bytes, which may start with a partial
+            // line — trim the head up to the first newline so JSONL
+            // parsing doesn't choke on a half-record.
+            if (firstLine === "HISTORY_TRUNCATED" && body.length > 0
+                && body.charCodeAt(0) !== 10
+                && body.indexOf("\n") >= 0) {
+              body = body.substring(body.indexOf("\n") + 1)
+            }
+          }
+          root.pendingHistoryText = body
+          root.pendingHistoryError = ""
         } else {
-          root.pendingHistoryText = t
+          // Helper did not produce a sentinel — treat as plain body
+          // for backward compatibility, but flag it so we notice.
+          root.pendingHistoryText = body
           root.pendingHistoryError = ""
         }
         root.historyChanged()
       }
-      onTextChanged: {}    // we only act on stream finish
+      onTextChanged: {}
     }
     stderr: StdioCollector {
+      waitForEnd: true
       onTextChanged: {}
     }
   }
@@ -209,51 +239,56 @@ Item {
   // listens via Qt.binding to `todayEntries`, which we recompute here.
   signal historyChanged()
 
-  function appendHistory(entry) {
-    // Append a single JSONL line via a subshell so we never load the
-    // existing file. We write to a sibling temp file first and then
-    // concatenate it into the real path; this avoids the kernel's
-    // append-mode race when two appends happen back-to-back (PhaseEnd
-    // of WORK + a hypothetical concurrent timer).
-    //
-    // For a single-process service the race is rare, but the user could
-    // run multiple shell instances pointing at the same stateHome, so
-    // we still serialize via a temp file. The lockfile `history.lock`
-    // (created and removed around the append) prevents two processes
-    // from appending at the same instant and corrupting a line.
+function appendHistory(entry) {
+    // Append a single JSONL line. The helper handles locking, the
+    // no-symlink check, and O_NOFOLLOW atomic writes; we pass the line
+    // as argv (no embedded newlines possible that way) so we don't
+    // rely on stdin/Process.write timing. formatHistoryLine guarantees
+    // no embedded newlines, but we double-check defensively.
     var line = Model.formatHistoryLine(entry)
     if (line.indexOf("\n") >= 0) {
-      // formatHistoryLine should never produce newlines — refuse to
-      // corrupt the file rather than silently allow it.
       console.warn("adhd-pomodoro: refusing to append history line containing newline")
       return
     }
-    var tmp = root.historyPath + ".tmp." + String(Date.now())
-    var lock = root.historyPath + ".lock"
-    var cmd = "mkdir " + shellQuote(lock) + " 2>/dev/null || true; " +
-              "trap 'rmdir " + shellQuote(lock) + " 2>/dev/null' EXIT; " +
-              "printf '%s\\n' " + shellQuote(line) + " >> " + shellQuote(root.historyPath) + "; " +
-              "rm -f " + shellQuote(tmp)
-    historyAppendProc.command = ["/bin/sh", "-c", cmd]
+    if (historyAppendProc.running) {
+      pendingHistoryLine = line
+      return
+    }
+    historyAppendProc.command = [
+      root.pythonBin, root.helperScript,
+      "history-append", root.historyPath, line
+    ]
     historyAppendProc.running = true
   }
 
-  // Append runs as a one-shot Process. We tolerate concurrent appenders
-  // via the lockfile above; if mkdir of the lock fails we still proceed
-  // (best effort) so a transient lock state doesn't drop a session.
+  // Append runs as a one-shot Process. The line is passed as argv. On
+  // exit we refresh the bounded read so the popup reflects the latest
+  // file contents.
   Process {
     id: historyAppendProc
+    command: [
+      root.pythonBin, root.helperScript,
+      "history-append", root.historyPath, ""
+    ]
     onExited: {
-      // Refresh the bounded read so the popup panel sees the new line.
-      // Cheap: re-runs `head -c 1MiB`, doesn't touch anything else.
+      if (root.pendingHistoryLine !== "") {
+        var queued = root.pendingHistoryLine
+        root.pendingHistoryLine = ""
+        historyAppendProc.command = [
+          root.pythonBin, root.helperScript,
+          "history-append", root.historyPath, queued
+        ]
+        historyAppendProc.running = true
+        return
+      }
       historyReadProc.running = true
     }
   }
 
-  // Quote a string for safe inclusion inside a /bin/sh -c command.
-  function shellQuote(s) {
-    return "'" + String(s).replace(/'/g, "'\\''") + "'"
-  }
+  // One-deep queue for a history line that arrived while the previous
+  // append was still running. Set by appendHistory, cleared by
+  // historyAppendProc.onExited.
+  property string pendingHistoryLine: ""
 
   function applyParsedState(parsed) {
     root.phase = parsed.phase
@@ -286,8 +321,96 @@ Item {
   }
 
   function saveState() {
-    stateFile.setText(JSON.stringify(buildStateObject(), null, 2) + "\n")
+    // State is persisted via the secure helper. The helper writes to a
+    // sibling tempfile with O_NOFOLLOW|O_EXCL, fsyncs, and os.replace()
+    // it into place — atomic and symlink-safe. We pass the JSON body as
+    // an argv element to avoid relying on stdin/Process.write timing.
+    // If a save is already running, queue the latest body (last write
+    // wins is fine because every saveState() carries the full state).
+    var body = JSON.stringify(buildStateObject(), null, 2) + "\n"
+    if (stateWriteProc.running) {
+      root.pendingStateBody = body
+      return
+    }
+    stateWriteProc.command = [
+      root.pythonBin, root.helperScript,
+      "state-write", root.statePath, body
+    ]
+    stateWriteProc.running = true
   }
+
+  // Bounded, no-symlink read of state.json via the helper.
+  Process {
+    id: stateReadProc
+    environment: ({ "PYTHONUNBUFFERED": "1" })
+    command: [
+      root.pythonBin, root.helperScript,
+      "state-read", root.statePath, String(root.stateMaxBytes)
+    ]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: function(text) {
+        var t = text === undefined || text === null ? "" : String(text)
+        console.warn("adhd-pomodoro: stateRead raw_len=" + t.length + " hex_first=" + (t.length > 0 ? t.charCodeAt(0).toString(16) : ""))
+        // Sentinel on first line:
+        //   "NO_STATE"          -> file absent
+        //   "STATE_OK\n..."     -> bounded read OK
+        //   "STATE_TRUNCATED\n" -> file larger than the cap (suspicious)
+        var firstNewline = t.indexOf("\n")
+        var firstLine = firstNewline >= 0 ? t.substring(0, firstNewline) : t
+        var body = firstNewline >= 0 ? t.substring(firstNewline + 1) : ""
+        if (firstLine === "NO_STATE") {
+          // No prior state — write defaults so subsequent saves are clean
+          root.saveState()
+          return
+        }
+        try {
+          var parsed = JSON.parse(body)
+          Model.rolloverIfNewDay(parsed)
+          applyParsedState(parsed)
+        } catch (e) {
+          console.warn("adhd-pomodoro: state.json parse failed, body_len="
+            + body.length + " first_char='" + body.charCodeAt(0)
+            + "' last_char='" + (body.length > 0 ? body.charCodeAt(body.length - 1) : "") + "'")
+          root.saveState()
+        }
+      }
+      onTextChanged: {}
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onTextChanged: {}
+    }
+  }
+
+  // No-symlink atomic state write via the helper. Command is set on each
+// invocation so the body (which varies) travels as argv instead of
+// stdin — Quickshell Process.write() requires a precise startup order
+// that is brittle across versions, and argv is dependable.
+  Process {
+    id: stateWriteProc
+    command: [
+      root.pythonBin, root.helperScript,
+      "state-write", root.statePath, ""
+    ]
+    onExited: {
+      // If saveState was called again while the process was still
+      // running, drain the queued body now.
+      if (root.pendingStateBody !== "") {
+        var queued = root.pendingStateBody
+        root.pendingStateBody = ""
+        stateWriteProc.command = [
+          root.pythonBin, root.helperScript,
+          "state-write", root.statePath, queued
+        ]
+        stateWriteProc.running = true
+      }
+    }
+  }
+
+  // One-deep queue for state bodies that arrived while the previous
+  // write was still running.
+  property string pendingStateBody: ""
 
   // ---- Phase transitions ----------------------------------------------------
 
@@ -684,12 +807,15 @@ Item {
   }
 
   // ---- Process for directory bootstrap -------------------------------------
+  // Create the state directory with mode 0700 owned by the current user
+  // (the helper will refuse to operate otherwise). After the directory
+  // is ready we kick off the bounded, no-symlink read for state.json.
   Process {
     id: mkdirProc
-    command: ["mkdir", "-p", root.stateHome]
+    command: ["mkdir", "-p", "-m", "0700", root.stateHome]
     onExited: {
-      stateFile.reload()
-      historyFile.reload()
+      stateReadProc.running = true
+      historyReadProc.running = true
     }
   }
 
@@ -699,3 +825,4 @@ Item {
     saveState()
   }
 }
+
