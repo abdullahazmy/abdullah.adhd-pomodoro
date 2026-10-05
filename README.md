@@ -16,10 +16,12 @@ per-day session log.
   and an append-only session history in `history.jsonl`. The state file
   stores `phaseStartedAt` (epoch ms) and `phaseDurationSecs`; the
   countdown is derived from the wall clock, so a shell restart mid-focus
-  resumes at the correct second. A running phase keeps a single 60-second
-  timer while the popup is closed and more than a minute remains; a
-  per-second tick kicks in when the popup opens or within 60 s of phase
-  end. IDLE / PAUSED use no timers at all.
+  resumes at the correct second. The service wakes only for real events
+  (the next pre-warning or phase end, at most once a minute) and writes
+  state only when something changes; a per-second tick runs only while
+  the popup is open. IDLE / PAUSED use no timers at all. The popup panel
+  is built the first time you open it, and only today's history entries
+  are kept in memory.
 - IPC routes on `abdullah.adhd-pomodoro` so a future CLI helper or
   keybinding can drive the same timer.
 
@@ -38,9 +40,11 @@ per-day session log.
 - **Last-30-seconds visual pulse** in the bar — the glyph and `mm:ss`
   switch to the urgent colour so the user notices even when they have
   drifted to a different window.
-- **Autostart next phase is OFF by default.** The user has to click to
-  start the next phase, which avoids the guilt-driven auto-cycle that
-  tends to backfire for ADHD brains.
+- **Autostart next phase is OFF by default.** When a phase ends, the
+  next one waits ("Up next: Short break") until you click Start, the
+  bar (right-click), or call `start` over IPC. This avoids the
+  guilt-driven auto-cycle that tends to backfire for ADHD brains.
+  Turn on "Auto-start next phase" in settings for the classic loop.
 - **Task label is encouraged, not required.** Naming what you are
   working on turns an abstract timer into "I am doing X right now".
 - **Session log surfaced in the panel.** Visible proof of progress
@@ -93,6 +97,9 @@ slate.
 ## Dependencies
 
 - `omarchy-notification-send` (shipped with Omarchy)
+- `python3` at `/usr/bin/python3` (shipped with Omarchy) — runs the
+  bundled `bin/adhd-pomodoro-helper.py`, which does all state and history
+  file IO with symlink-safe, size-bounded reads and atomic writes
 - `paplay` (from `pulseaudio-utils` / `pipewire-pulse`) — only used for
   the optional end-of-phase chime; the plugin silently no-ops if missing.
 
@@ -102,9 +109,6 @@ This plugin only writes inside `~/.local/state/abdullah.adhd-pomodoro/`
 and the Omarchy user config. It does not modify `/usr/share/omarchy/`,
 your shell startup files, or any application config outside its own
 state directory.
-
-(or edit `~/.config/omarchy/shell.json` by hand if you want it
-somewhere specific).
 
 ## Validate
 
@@ -119,6 +123,8 @@ omarchy plugin validate ~/.config/omarchy/plugins/abdullah.adhd-pomodoro
 - `BarWidget.qml` — bar slot
 - `Panel.qml` — popup panel
 - `Model.js` — pure helpers: state machine, persistence, formatting
+- `bin/adhd-pomodoro-helper.py` — hardened file IO for `state.json` and
+  `history.jsonl`
 - `LICENSE` — MIT
 
 ## Settings
@@ -148,6 +154,8 @@ abdullah.adhd-pomodoro.resume
 abdullah.adhd-pomodoro.reset
 abdullah.adhd-pomodoro.skip
 abdullah.adhd-pomodoro.setTask  "Write the design doc"
+abdullah.adhd-pomodoro.updateSettings '{"workMinutes": 50}'   # partial update
+abdullah.adhd-pomodoro.toggleSound
 abdullah.adhd-pomodoro.status        # returns a JSON snapshot
 abdullah.adhd-pomodoro.history       # returns today's history JSON array
 abdullah.adhd-pomodoro.togglePanel

@@ -54,17 +54,18 @@ BarWidget {
   readonly property int phaseDurationSecs: _service() ? _service().phaseDurationSecs : 0
   readonly property string taskLabel: _service() ? (_service().taskLabel || "") : ""
   // The bar widget owns a 1 Hz Timer that drives this binding.
-  property int localNowSec: Math.floor(Date.now() / 1000)
+  property real localNowMs: Date.now()
   property int secondsLeft: {
     var p = root.phase
     var s
     if (p === Model.PHASE_PAUSED) {
       s = _service() ? _service().phasePausedSecondsLeft : 0
     } else if (p === Model.PHASE_IDLE) {
-      s = root.phaseDurationSecs > 0 ? root.phaseDurationSecs : 1500
+      s = _service() ? Model.phaseSeconds(Model.PHASE_WORK, _service().settings) : 1500
     } else if (root.phaseStartedAtMs && root.phaseDurationSecs) {
-      var startedSec = Math.floor(root.phaseStartedAtMs / 1000)
-      s = Math.max(0, root.phaseDurationSecs - (root.localNowSec - startedSec))
+      // Same arithmetic as Model.secondsLeftFromStart so the bar and
+      // the panel never disagree by a second.
+      s = Model.secondsLeftFromStart(root.phaseStartedAtMs, root.phaseDurationSecs, root.localNowMs)
     } else {
       s = 0
     }
@@ -100,14 +101,25 @@ BarWidget {
     }
   }
 
+  // The panel (TextFields, settings drawer, session list) is only built
+  // the first time it is opened, so a bar that never opens the popup
+  // never pays for it. Loader loads synchronously, so the item exists
+  // as soon as `active` flips.
+  function ensurePanel() {
+    if (!panelLoader.active) panelLoader.active = true
+    return panelLoader.item
+  }
+
   function open() {
-    if (panelLoader.item) panelLoader.item.open()
+    var p = ensurePanel()
+    if (p) p.open()
   }
   function close() {
     if (panelLoader.item) panelLoader.item.close()
   }
   function toggle() {
-    if (panelLoader.item) panelLoader.item.toggle()
+    var p = ensurePanel()
+    if (p) p.toggle()
   }
   function closeForPopoutSwitch() {
     if (panelLoader.item) panelLoader.item.closeForPopoutSwitch()
@@ -140,28 +152,22 @@ BarWidget {
   //
   // To keep the bar showing a smooth per-second countdown without paying
   // for a global 1 Hz timer in the shell process, this widget runs its own
-  // 1 Hz Timer ONLY while it is mapped to a screen (i.e. the bar is
-  // visible somewhere) AND a phase is running. The Timer just calls
-  // `service.recomputeSeconds()` — no logic, no state, no I/O — so the
-  // wake-up cost is a single property read + comparison + a property
-  // assignment when the digit changes. The widget is destroyed when the
-  // bar host unmounts the widget, so the Timer goes with it.
+  // 1 Hz Timer ONLY while a phase is running. The Timer just refreshes
+  // `localNowMs` — no logic, no state, no I/O. The widget is destroyed
+  // when the bar host unmounts it, so the Timer goes with it.
   Timer {
     id: barTick
     interval: 1000
     repeat: true
     running: Model.isRunningPhase(root.phase)
-    onTriggered: root.localNowSec = Math.floor(Date.now() / 1000)
+    triggeredOnStart: true
+    onTriggered: root.localNowMs = Date.now()
   }
-
-  // React to phase transitions: start ticking when a phase begins, stop
-  // when it ends (or pauses).
-  onPhaseChanged: barTick.running = Model.isRunningPhase(root.phase)
 
   // ---- Panel loader --------------------------------------------------------
   Loader {
     id: panelLoader
-    active: true
+    active: false
     source: Qt.resolvedUrl("Panel.qml")
     visible: false
     onLoaded: {
@@ -293,6 +299,7 @@ BarWidget {
         textFormat: Text.PlainText
         text: root.phase === Model.PHASE_WORK ? "FOCUS"
               : root.phase === Model.PHASE_PAUSED ? "PAUSE"
+              : root.phase === Model.PHASE_IDLE ? "IDLE"
               : "BREAK"
         color: button.foreground
         font.family: button.fontFamily

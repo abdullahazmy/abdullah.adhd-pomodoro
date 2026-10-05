@@ -9,14 +9,11 @@
 // it via `bar.shell.serviceFor(...)` rather than reading the file itself, so
 // the two never disagree about which second the timer is on.
 //
-// Timing model (v0.1.5+): the service stores `phaseStartedAt` (epoch ms)
-// and `phaseDurationSecs`, then computes `secondsLeft` on demand from the
-// wall clock. A running phase has no per-second timer while the popup is
-// closed and we are more than a minute from phase end — only a single
-// 60-second timer that handles phase-end detection, pre-warning
-// boundaries, and `secondsLeft` recomputation. This means the bar widget
-// stays accurate to within one second even with no per-second wake-up,
-// and a paused or idle plugin uses no timers at all.
+// Timing model: the service stores `phaseStartedAt` (epoch ms) and
+// `phaseDurationSecs`, then derives `secondsLeft` from the wall clock. It
+// wakes only for real events (the next pre-warning or phase end, capped at
+// 60 s so a suspend/resume is noticed promptly) and keeps a 1 Hz tick only
+// while the popup is open. A paused or idle plugin uses no timers at all.
 
 // ---------- Phase constants -------------------------------------------------
 
@@ -104,19 +101,30 @@ function secondsLeftFromStart(phaseStartedAt, phaseDurationSecs, nowMs) {
   return Math.max(0, phaseDurationSecs - elapsed)
 }
 
-// Decide whether a phase's secondsLeft represents a "pre-warning" — i.e. one
-// of the soon-to-end warnings the user has configured (e.g. 2 min, 30 s).
-// Returns true exactly once per phase crossing for each configured second,
-// by comparing against the last-fired-seconds memo.
-function shouldFirePreWarning(secondsLeft, preWarningSeconds, lastFiredSeconds) {
-  if (!preWarningSeconds || preWarningSeconds.length === 0) return false;
-  if (secondsLeft < 0) return false;
+// Configured pre-warning seconds that apply to a phase of
+// `phaseDurationSecs`: finite, positive, shorter than the phase, and not
+// yet announced. Sorted descending (the order they come due).
+function pendingWarnings(preWarningSeconds, lastFiredSeconds, phaseDurationSecs) {
+  var out = [];
+  if (!Array.isArray(preWarningSeconds)) return out;
+  var fired = Array.isArray(lastFiredSeconds) ? lastFiredSeconds : [];
   for (var i = 0; i < preWarningSeconds.length; i++) {
-    var t = Number(preWarningSeconds[i]);
-    if (!isFinite(t) || t < 0) continue;
-    if (secondsLeft === t && lastFiredSeconds.indexOf(t) === -1) return true;
+    var t = Math.floor(Number(preWarningSeconds[i]));
+    if (!isFinite(t) || t <= 0 || t >= phaseDurationSecs) continue;
+    if (fired.indexOf(t) !== -1 || out.indexOf(t) !== -1) continue;
+    out.push(t);
   }
-  return false;
+  out.sort(function (x, y) { return y - x; });
+  return out;
+}
+
+// The next secondsLeft value the service must wake up at: the largest
+// pending pre-warning below `secondsLeft`, or 0 (phase end).
+function nextWakeBoundary(secondsLeft, pending) {
+  for (var i = 0; i < pending.length; i++) {
+    if (pending[i] < secondsLeft) return pending[i];
+  }
+  return 0;
 }
 
 // ---------- State machine ---------------------------------------------------
@@ -165,6 +173,7 @@ function defaultState() {
     phaseDurationSecs: 0,
     phasePausedSecondsLeft: 0,
     completedWorkSessionsToday: 0,
+    pausedPhase: "",
     lastResetDate: todayKey(),
     taskLabel: "",
     settings: s,
@@ -175,7 +184,10 @@ function defaultState() {
 // ---------- Date helpers ----------------------------------------------------
 
 function todayKey() {
-  var d = new Date();
+  return dateKey(new Date());
+}
+
+function dateKey(d) {
   return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
 }
 
@@ -226,7 +238,9 @@ function mergeState(persisted) {
   var base = defaultState();
   if (!persisted || typeof persisted !== "object") return base;
 
-  base.phase = (persisted.phase && typeof persisted.phase === "string") ? persisted.phase : base.phase;
+  var phases = [PHASE_IDLE, PHASE_WORK, PHASE_SHORT_BREAK, PHASE_LONG_BREAK, PHASE_PAUSED];
+  if (phases.indexOf(persisted.phase) !== -1) base.phase = persisted.phase;
+  if (isRunningPhase(persisted.pausedPhase)) base.pausedPhase = persisted.pausedPhase;
   base.completedWorkSessionsToday = Number(persisted.completedWorkSessionsToday) || 0;
   base.lastResetDate = persisted.lastResetDate || base.lastResetDate;
   base.taskLabel = typeof persisted.taskLabel === "string" ? persisted.taskLabel : "";
@@ -235,6 +249,9 @@ function mergeState(persisted) {
     ? persisted.lastFiredWarningSeconds.slice() : [];
 
   // New schema: explicit timestamps.
+  if (typeof persisted.phaseDurationSecs === "number" && persisted.phaseDurationSecs > 0) {
+    base.phaseDurationSecs = Math.floor(persisted.phaseDurationSecs);
+  }
   if (typeof persisted.phaseStartedAt === "number" && typeof persisted.phaseDurationSecs === "number") {
     base.phaseStartedAt = persisted.phaseStartedAt;
     base.phaseDurationSecs = persisted.phaseDurationSecs;
@@ -292,18 +309,29 @@ function formatHistoryLine(entry) {
 }
 
 // History rows for the panel's "Today" list. Filters to entries on today's
-// local date and returns newest-first.
+// local date and returns newest-first. `ts` is stored as UTC ISO, so the
+// comparison has to go through a Date — slicing the string would file a
+// session at 01:00 local (UTC+3) under yesterday.
 function todayHistoryEntries(allEntries) {
   var today = todayKey();
   var filtered = [];
   for (var i = 0; i < allEntries.length; i++) {
     var e = allEntries[i];
-    if (!e || !e.ts) continue;
-    // ts is an ISO string; compare the YYYY-MM-DD prefix.
-    if (typeof e.ts === "string" && e.ts.slice(0, 10) === today) filtered.push(e);
+    if (!e || typeof e.ts !== "string") continue;
+    var d = new Date(e.ts);
+    if (isNaN(d.getTime())) continue;
+    if (dateKey(d) === today) filtered.push(e);
   }
   filtered.sort(function (a, b) { return a.ts < b.ts ? 1 : -1; });
   return filtered;
+}
+
+// Local midnight as a UTC ISO string. The helper keeps only history lines
+// whose `ts` sorts at or after this, so the shell never holds more than
+// today's entries.
+function localMidnightIso() {
+  var d = new Date();
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).toISOString();
 }
 
 // Short clock for the history row, e.g. "09:14".

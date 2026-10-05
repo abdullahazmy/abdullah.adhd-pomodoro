@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Helper for abdullah.adhd-pomodoro.
 
-Three modes, selected by argv[1]:
+Four modes, selected by argv[1]:
 
   state-read        PATH [MAX_BYTES]
-  state-write        PATH   (reads JSON body from stdin, atomic write)
-  history-read       PATH [MAX_BYTES]
-  history-append     PATH   (reads a single JSON line from stdin; appends
-                             to PATH under flock, returns sentinel on failure)
+  state-write       PATH [BODY]      (BODY from argv, or stdin if omitted;
+                                      atomic write)
+  history-read      PATH [MAX_BYTES] [SINCE_ISO]
+  history-append    PATH [LINE]      (LINE from argv, or stdin if omitted;
+                                      appended under flock)
 
 Safety properties enforced:
 
@@ -19,15 +20,15 @@ Safety properties enforced:
 
   * Reads are bounded by MAX_BYTES so a planted huge file cannot
     exhaust memory. State reads run from the start; history reads
-    return the last MAX_BYTES (the file is append-only).
+    seek to the last MAX_BYTES (the file is append-only).
 
   * Writes are atomic at the filesystem level: we write to a sibling
-    tempfile, fsync, then os.replace() the temp into place. os.replace
-    behaves like rename(2) and does not follow symlinks.
+    tempfile created with O_EXCL|O_NOFOLLOW, fsync, then os.replace()
+    the temp into place. os.replace behaves like rename(2) and does not
+    follow symlinks.
 
-  * History appends take an exclusive flock on the path before opening
-    it, so concurrent appenders serialize and `printf >> path` cannot
-    interleave bytes.
+  * History appends take an exclusive flock on the path before writing,
+    so concurrent appenders serialize and cannot interleave bytes.
 
 Output protocol: every stdout payload begins with a sentinel line
 followed by a newline and (optionally) the body bytes. The QML side
@@ -38,42 +39,69 @@ parses the first line as the sentinel:
   STATE_TRUNCATED\\n<bytes>      state.json larger than the cap
 
   NO_HISTORY                     history.jsonl absent or a symlink
-  HISTORY_OK\\n<bytes>           history.jsonl read OK
-  HISTORY_TRUNCATED\\n<bytes>    history.jsonl larger than the cap
+  HISTORY_OK\\n<lines>           history.jsonl read OK
+  HISTORY_TRUNCATED\\n<lines>    history.jsonl larger than the cap
 
   HISTORY_APPENDED               append succeeded
-"""
 
-from __future__ import annotations
+When SINCE_ISO is given, history-read only returns lines whose `ts`
+field sorts at or after it (ISO-8601 UTC strings compare
+lexicographically). The QML side passes local midnight, so the shell
+only ever holds today's entries in memory instead of the whole tail.
+
+The helper deliberately imports only os/sys/errno/fcntl/json so the
+interpreter starts fast when invoked with `python3 -I -S`.
+"""
 
 import errno
 import fcntl
+import json
 import os
 import sys
-import tempfile
-from typing import Tuple
+
+STATE_CAP_DEFAULT = 262144      # 256 KiB
+HISTORY_CAP_DEFAULT = 65536     # 64 KiB — weeks of sessions
 
 
-def _err(code: int, msg: str) -> None:
+def _err(code, msg):
     sys.stderr.write("adhd-pomodoro-helper: {}\n".format(msg))
     sys.stderr.flush()
     sys.exit(code)
 
 
-def _emit(sentinel: bytes) -> None:
-    sys.stdout.buffer.write(sentinel + b"\n")
-    sys.stdout.buffer.flush()
+def _emit(sentinel, body=b""):
+    out = sys.stdout.buffer
+    out.write(sentinel + b"\n")
+    if body:
+        out.write(body)
+    out.flush()
 
 
-def _check_owner_dir(path: str) -> Tuple[int, int]:
-    """Resolve `path`, verify it is owned by the running user and is
-    not group/world-writable. Returns (uid, gid) of the resolved dir.
+def _arg(index, default=None):
+    return sys.argv[index] if len(sys.argv) > index else default
+
+
+def _cap(index, default):
+    try:
+        value = int(_arg(index, default))
+    except ValueError:
+        _err(64, "invalid byte cap")
+    if value <= 0:
+        _err(64, "invalid byte cap")
+    return value
+
+
+def _check_owner_dir(path):
+    """Verify the parent directory of `path` is owned by the running user
+    and is not group/world-writable.
     """
-    parent = os.path.dirname(os.path.abspath(path))
-    real_parent = os.path.realpath(parent)
+    real_parent = os.path.realpath(os.path.dirname(os.path.abspath(path)))
+    try:
+        st = os.stat(real_parent)
+    except OSError:
+        _err(2, "state directory missing: " + real_parent)
     if not os.path.isdir(real_parent):
         _err(2, "state directory missing: " + real_parent)
-    st = os.stat(real_parent)
     uid = os.getuid()
     if st.st_uid != uid:
         _err(3, "state directory owned by uid {} but we are uid {}".format(
@@ -81,80 +109,97 @@ def _check_owner_dir(path: str) -> Tuple[int, int]:
     if st.st_mode & 0o022:
         _err(4, "state directory is group/world writable: mode 0o{:o}".format(
             st.st_mode))
-    return (st.st_uid, st.st_gid)
 
 
-def _open_nofollow(path: str, flags: int, mode: int = 0o600):
-    """Open `path` without following symlinks. Returns a file descriptor.
-    Caller is responsible for closing it.
+def _open_regular_ro(path):
+    """Open `path` read-only without following symlinks. Returns an fd,
+    or None if the path is absent, a symlink, or not a regular file.
     """
-    return os.open(path, flags | os.O_NOFOLLOW, mode)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as e:
+        if e.errno in (errno.ENOENT, errno.ELOOP):
+            return None
+        raise
+    st = os.fstat(fd)
+    if not (st.st_mode & 0o170000 == 0o100000):  # S_ISREG
+        os.close(fd)
+        return None
+    return fd
 
 
-def _state_read(max_bytes: int) -> None:
-    if len(sys.argv) < 3:
+def _read_all(fd, limit):
+    chunks = []
+    remaining = limit
+    while remaining > 0:
+        chunk = os.read(fd, min(remaining, 65536))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _state_read():
+    path = _arg(2)
+    if path is None:
         _err(64, "state-read: usage")
-    path = sys.argv[2]
-    cap = int(sys.argv[3]) if len(sys.argv) > 3 else 262144  # 256 KiB
+    cap = _cap(3, STATE_CAP_DEFAULT)
     _check_owner_dir(path)
-    if not os.path.exists(path):
+    if os.path.islink(path):
+        _err(5, "state path is a symlink: " + path)
+    try:
+        fd = _open_regular_ro(path)
+    except OSError as e:
+        _err(6, "cannot open state path: " + str(e))
+    if fd is None:
+        if os.path.lexists(path):
+            _err(5, "state path is not a regular file: " + path)
         _emit(b"NO_STATE")
         return
-    if os.path.islink(path):
-        _err(5, "state path is a symlink: " + path)
-    if not os.path.isfile(path):
-        _err(5, "state path is not a regular file: " + path)
     try:
-        fd = _open_nofollow(path, os.O_RDONLY)
+        # Read up to cap+1 bytes to detect truncation.
+        data = _read_all(fd, cap + 1)
     except OSError as e:
-        if e.errno == errno.ELOOP:
-            _err(5, "state path is a symlink: " + path)
-        _err(6, "cannot open state path: " + str(e))
-    # Read up to cap+1 bytes to detect truncation.
-    try:
-        data = os.read(fd, cap + 1)
-    except OSError as e:
-        os.close(fd)
         _err(6, "cannot read state path: " + str(e))
     finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    truncated = len(data) > cap
-    if truncated:
-        data = data[:cap]
-    sentinel = b"STATE_TRUNCATED" if truncated else b"STATE_OK"
-    sys.stdout.buffer.write(sentinel + b"\n")
-    sys.stdout.buffer.write(data)
-    sys.stdout.buffer.flush()
+        os.close(fd)
+    if len(data) > cap:
+        _emit(b"STATE_TRUNCATED", data[:cap])
+    else:
+        _emit(b"STATE_OK", data)
 
 
-def _state_write() -> None:
-    if len(sys.argv) < 3:
+def _state_write():
+    path = _arg(2)
+    if path is None:
         _err(64, "state-write: usage")
-    path = sys.argv[2]
     _check_owner_dir(path)
     if os.path.islink(path):
         _err(5, "state path is a symlink: " + path)
-    if len(sys.argv) < 4:
-        # No body passed via argv — fall back to stdin for callers that
-        # support it.
-        raw = sys.stdin.buffer.read()
-    else:
-        raw = sys.argv[3].encode("utf-8")
-    if not isinstance(raw, (bytes, bytearray)):
-        _err(7, "state-write: body must be bytes")
+    body = _arg(3)
+    raw = sys.stdin.buffer.read() if body is None else body.encode("utf-8")
     parent = os.path.dirname(os.path.abspath(path))
-    # Write to a sibling temp file with O_NOFOLLOW|O_EXCL, fsync, then
-    # os.replace() into place. os.replace replaces a symlink target if
-    # one is present at `path`, so a planted symlink cannot redirect
-    # the write to an arbitrary location.
-    fd, tmp = tempfile.mkstemp(prefix=".state.", suffix=".tmp", dir=parent)
+    tmp = os.path.join(parent, ".state.{}.tmp".format(os.getpid()))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     try:
-        os.chmod(tmp, 0o600)
+        fd = os.open(tmp, flags, 0o600)
+    except FileExistsError:
+        # Leftover from a crashed writer that had our pid. unlink()
+        # removes a symlink itself, never its target.
         try:
-            os.write(fd, raw)
+            os.unlink(tmp)
+            fd = os.open(tmp, flags, 0o600)
+        except OSError as e:
+            _err(7, "cannot create temp state file: " + str(e))
+    except OSError as e:
+        _err(7, "cannot create temp state file: " + str(e))
+    try:
+        try:
+            view = memoryview(raw)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -167,119 +212,100 @@ def _state_write() -> None:
         raise
 
 
-def _history_read(max_bytes: int) -> None:
-    if len(sys.argv) < 3:
+def _history_read():
+    path = _arg(2)
+    if path is None:
         _err(64, "history-read: usage")
-    path = sys.argv[2]
-    cap = int(sys.argv[3]) if len(sys.argv) > 3 else 1048576  # 1 MiB
+    cap = _cap(3, HISTORY_CAP_DEFAULT)
+    since = _arg(4, "")
     _check_owner_dir(path)
-    if not os.path.exists(path):
-        _emit(b"NO_HISTORY")
-        return
-    if os.path.islink(path):
-        _emit(b"NO_HISTORY")  # refuse silently on symlinks
-        return
-    if not os.path.isfile(path):
-        _emit(b"NO_HISTORY")
-        return
     try:
-        fd = _open_nofollow(path, os.O_RDONLY)
+        fd = _open_regular_ro(path)
     except OSError as e:
-        if e.errno == errno.ELOOP:
-            _emit(b"NO_HISTORY")
-            return
         _err(9, "cannot open history path: " + str(e))
-    # Read up to cap+1 bytes so we can detect truncation.
+    if fd is None:
+        _emit(b"NO_HISTORY")
+        return
     try:
-        data = os.read(fd, cap + 1)
+        size = os.fstat(fd).st_size
+        truncated = size > cap
+        if truncated:
+            # Append-only file: only the tail can contain recent entries.
+            os.lseek(fd, size - cap, os.SEEK_SET)
+        data = _read_all(fd, cap)
     except OSError as e:
-        os.close(fd)
         _err(9, "cannot read history path: " + str(e))
     finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    truncated = len(data) > cap
-    if truncated:
-        # History file is append-only, so keep the tail.
-        data = data[-cap:]
-    sentinel = b"HISTORY_TRUNCATED" if truncated else b"HISTORY_OK"
-    sys.stdout.buffer.write(sentinel + b"\n")
-    sys.stdout.buffer.write(data)
-    sys.stdout.buffer.flush()
+        os.close(fd)
+
+    lines = data.split(b"\n")
+    if truncated and lines:
+        lines = lines[1:]  # first line is probably a partial record
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if since:
+            try:
+                ts = json.loads(line).get("ts")
+            except (ValueError, AttributeError):
+                continue
+            if not isinstance(ts, str) or ts < since:
+                continue
+        out.append(line)
+    body = b"\n".join(out) + b"\n" if out else b""
+    _emit(b"HISTORY_TRUNCATED" if truncated else b"HISTORY_OK", body)
 
 
-def _history_append() -> None:
-    if len(sys.argv) < 3:
+def _history_append():
+    path = _arg(2)
+    if path is None:
         _err(64, "history-append: usage")
-    path = sys.argv[2]
     _check_owner_dir(path)
-    if len(sys.argv) < 4:
-        line = sys.stdin.buffer.read()
-    else:
-        line = sys.argv[3].encode("utf-8")
+    arg_line = _arg(3)
+    line = sys.stdin.buffer.read() if arg_line is None else arg_line.encode("utf-8")
     if b"\n" in line:
         _err(10, "history line contains newline")
     if os.path.islink(path):
         _err(11, "history path is a symlink: " + path)
-    if not os.path.exists(path):
-        # Create as a regular file with no-follow. If a symlink raced in
-        # here, EEXIST is raised and we bail.
-        try:
-            fd = _open_nofollow(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-        except OSError as e:
-            if e.errno == errno.EEXIST:
-                _err(12, "history path appeared as symlink during open: " + path)
-            _err(13, "cannot create history file: " + str(e))
-    else:
-        if os.path.islink(path):
-            _err(11, "history path is a symlink: " + path)
-        # O_APPEND so each appender writes at end-of-file regardless of
-        # its seek position. Combined with flock(LOCK_EX) below, this
-        # serializes without interleaving bytes.
-        try:
-            fd = _open_nofollow(path, os.O_RDWR | os.O_APPEND)
-        except OSError as e:
-            if e.errno == errno.ELOOP:
-                _err(11, "history path is a symlink: " + path)
-            _err(13, "cannot open history file: " + str(e))
+    # O_APPEND so each appender writes at end-of-file regardless of its
+    # seek position. O_NOFOLLOW refuses a symlink that raced in.
     try:
-        # Take an exclusive flock before any I/O happens so concurrent
-        # appenders serialize. flock waits; failures bubble out.
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            _err(11, "history path is a symlink: " + path)
+        _err(13, "cannot open history file: " + str(e))
+    try:
+        if os.fstat(fd).st_mode & 0o170000 != 0o100000:
+            _err(11, "history path is not a regular file: " + path)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
         except OSError as e:
             _err(14, "flock failed: " + str(e))
-        # Re-stat under the lock — someone could have replaced the
-        # path with a symlink between open and flock.
-        if not os.path.isfile(path) or os.path.islink(path):
-            _err(11, "history path is not regular after lock: " + path)
         os.write(fd, line + b"\n")
         os.fsync(fd)
         _emit(b"HISTORY_APPENDED")
     finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        os.close(fd)
 
 
-def main() -> None:
+MODES = {
+    "state-read": _state_read,
+    "state-write": _state_write,
+    "history-read": _history_read,
+    "history-append": _history_append,
+}
+
+
+def main():
     if len(sys.argv) < 2:
         _err(64, "usage: helper.py MODE PATH [..]")
-    mode = sys.argv[1]
-    cap = int(os.environ.get("ADHD_MAX", "1048576"))
-    if mode == "state-read":
-        _state_read(cap)
-    elif mode == "state-write":
-        _state_write()
-    elif mode == "history-read":
-        _history_read(cap)
-    elif mode == "history-append":
-        _history_append()
-    else:
-        _err(64, "unknown mode: " + mode)
+    handler = MODES.get(sys.argv[1])
+    if handler is None:
+        _err(64, "unknown mode: " + sys.argv[1])
+    handler()
 
 
 if __name__ == "__main__":

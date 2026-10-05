@@ -22,8 +22,6 @@ Panel {
   manageIpc: false    // The service owns the IPC handler so callers
                       // (bar widget, future CLI) reach the same methods.
 
-  Component.onCompleted: {}
-
   property var anchorItem: null
   property var hostWidget: null
   property var service: null
@@ -55,7 +53,11 @@ Panel {
   // once a minute via the slow tick, then per second once the popup opens
   // or we are within 60 s of phase end.
   readonly property string mmss: Model.formatMMSS(secondsLeft)
-  readonly property string phaseLabel: Model.phaseLabel(phase)
+  // PAUSED at full length means the next phase is parked, waiting for
+  // the user to start it (autostartNext off).
+  readonly property bool awaitingStart: service ? service.awaitingStart === true : false
+  readonly property string upNextLabel: awaitingStart ? Model.phaseLabel(service.pausedPhase) : ""
+  readonly property string phaseLabel: awaitingStart ? "Up next: " + upNextLabel : Model.phaseLabel(phase)
   readonly property string phaseGlyph: Model.phaseGlyph(phase)
   readonly property bool running: Model.isRunningPhase(phase)
   readonly property bool canStart: phase === Model.PHASE_IDLE || phase === Model.PHASE_PAUSED || !Model.isRunningPhase(phase)
@@ -65,28 +67,10 @@ Panel {
   // ---- Settings drawer toggle --------------------------------------------
   property bool settingsOpen: false
 
-  // ---- Today's history (lazy-loaded) -------------------------------------
-  // history.jsonl is read by the service through a bounded Process (see
-  // PomodoroService.qml historyReadProc). We do NOT load it here via a
-  // FileView, since the file grows forever and an unbounded read on the
-  // popup would balloon the shared shell's memory.
-  property var todayEntries: []
-  // Recompute todayEntries whenever the service refreshes its bounded
-  // history read. The service exposes the bounded text as
-  // `pendingHistoryText` and a `historyChanged` signal.
-  function recomputeTodayEntries() {
-    if (!root.service) {
-      root.todayEntries = []
-      return
-    }
-    var entries = Model.parseHistoryFile(root.service.pendingHistoryText || "")
-    root.todayEntries = Model.todayHistoryEntries(entries)
-  }
-  Connections {
-    target: root.service
-    function onHistoryChanged() { root.recomputeTodayEntries() }
-    function onPendingHistoryTextChanged() { root.recomputeTodayEntries() }
-  }
+  // ---- Today's history ---------------------------------------------------
+  // The service keeps today's entries parsed in memory (newest first); the
+  // panel just binds to them.
+  readonly property var todayEntries: service ? service.todayEntries : []
   // Hide the entire SESSIONS list by default on days with many sessions,
   // so the Settings drawer is always reachable. Toggle "Show sessions
   // list" in the drawer to bring it back. Light days still show the list
@@ -97,9 +81,8 @@ Panel {
     todayEntries.length > sessionsCollapseThreshold
   property bool sessionsHidden: false
 
-  // Whenever the panel becomes visible, ask the service to refresh its
-  // bounded history read. The result lands in service.pendingHistoryText,
-  // which we recompute todayEntries from.
+  // Whenever the panel becomes visible, let the service re-read history
+  // if its cached list is from an earlier day (no-op otherwise).
   onOpenedChanged: if (opened) {
     if (root.service && typeof root.service.refreshHistory === "function") {
       root.service.refreshHistory()
@@ -110,12 +93,6 @@ Panel {
       taskField.text = root.taskLabel
       taskField.forceActiveFocus()
     })
-  }
-
-  function reloadHistory() {
-    if (root.service && typeof root.service.refreshHistory === "function") {
-      root.service.refreshHistory()
-    }
   }
 
   // ---- Actions ------------------------------------------------------------
@@ -278,7 +255,7 @@ Panel {
               // write back to root.taskLabel mid-keystroke, so the bar
               // widget only updates after the user confirms.
               onEditingFinished: {
-                if (text !== root.taskLabel) root.service.setTask(text)
+                if (root.service && text !== root.taskLabel) root.service.setTask(text)
               }
               Keys.onReturnPressed: { taskField.editingFinished(); Qt.inputMethod.hide() }
               Keys.onEnterPressed: { taskField.editingFinished(); Qt.inputMethod.hide() }
@@ -295,6 +272,7 @@ Panel {
         Button {
           objectName: "startButton"
           text: root.canPause ? "Pause"
+                : root.awaitingStart ? "Start " + root.upNextLabel.toLowerCase()
                 : root.canResume ? "Resume"
                 : root.canStart ? "Start focus" : "Start"
           iconText: root.canPause ? "󰏤" : "󰐊"
