@@ -4,11 +4,15 @@
 Four modes, selected by argv[1]:
 
   state-read        PATH [MAX_BYTES]
-  state-write       PATH [BODY]      (BODY from argv, or stdin if omitted;
-                                      atomic write)
+  state-write       PATH             (body from $ADHD_POMODORO_PAYLOAD,
+                                      or stdin if unset; atomic write)
   history-read      PATH [MAX_BYTES] [SINCE_ISO]
-  history-append    PATH [LINE]      (LINE from argv, or stdin if omitted;
-                                      appended under flock)
+  history-append    PATH             (line from $ADHD_POMODORO_PAYLOAD,
+                                      or stdin if unset; appended under flock)
+
+Payloads (state bodies, history lines) contain task labels and are never
+accepted as arguments: /proc/<pid>/cmdline is readable by every local
+user, while /proc/<pid>/environ and stdin are private to the owner.
 
 Safety properties enforced:
 
@@ -89,6 +93,18 @@ def _cap(index, default):
     if value <= 0:
         _err(64, "invalid byte cap")
     return value
+
+
+PAYLOAD_VAR = "ADHD_POMODORO_PAYLOAD"
+
+
+def _payload(mode):
+    if len(sys.argv) > 3:
+        _err(64, mode + ": payload must not be passed as an argument")
+    value = os.environ.pop(PAYLOAD_VAR, None)
+    if value is not None:
+        return os.fsencode(value)
+    return sys.stdin.buffer.read()
 
 
 def _check_owner_dir(path):
@@ -177,8 +193,7 @@ def _state_write():
     _check_owner_dir(path)
     if os.path.islink(path):
         _err(5, "state path is a symlink: " + path)
-    body = _arg(3)
-    raw = sys.stdin.buffer.read() if body is None else body.encode("utf-8")
+    raw = _payload("state-write")
     parent = os.path.dirname(os.path.abspath(path))
     tmp = os.path.join(parent, ".state.{}.tmp".format(os.getpid()))
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
@@ -263,8 +278,7 @@ def _history_append():
     if path is None:
         _err(64, "history-append: usage")
     _check_owner_dir(path)
-    arg_line = _arg(3)
-    line = sys.stdin.buffer.read() if arg_line is None else arg_line.encode("utf-8")
+    line = _payload("history-append")
     if b"\n" in line:
         _err(10, "history line contains newline")
     if os.path.islink(path):

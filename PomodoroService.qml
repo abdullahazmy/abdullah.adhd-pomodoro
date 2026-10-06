@@ -64,6 +64,21 @@ Item {
     return root.helperArgv.concat(args)
   }
 
+  // State bodies and history lines carry task labels, so they must never
+  // travel in argv: /proc/<pid>/cmdline is world-readable on a default
+  // procfs mount. They go in the environment instead, and
+  // /proc/<pid>/environ is readable only by the same user (and root).
+  // argv carries nothing but the mode, the path and numeric limits.
+  readonly property string payloadVar: "ADHD_POMODORO_PAYLOAD"
+
+  function runHelperWithPayload(proc, args, payload) {
+    var env = {}
+    env[root.payloadVar] = payload
+    proc.environment = env
+    proc.command = helperCommand(args)
+    proc.running = true
+  }
+
   // Cap on a single state.json read. The document is a few hundred bytes.
   readonly property int stateMaxBytes: 262144     // 256 KiB
   // Cap on the history tail scanned for today's entries. A day of
@@ -195,8 +210,7 @@ Item {
       root.pendingHistoryLines = root.pendingHistoryLines.concat([line])
       return
     }
-    historyAppendProc.command = helperCommand(["history-append", root.historyPath, line])
-    historyAppendProc.running = true
+    runHelperWithPayload(historyAppendProc, ["history-append", root.historyPath], line)
   }
 
   Process {
@@ -205,8 +219,7 @@ Item {
       if (root.pendingHistoryLines.length === 0) return
       var next = root.pendingHistoryLines[0]
       root.pendingHistoryLines = root.pendingHistoryLines.slice(1)
-      historyAppendProc.command = root.helperCommand(["history-append", root.historyPath, next])
-      historyAppendProc.running = true
+      root.runHelperWithPayload(historyAppendProc, ["history-append", root.historyPath], next)
     }
   }
 
@@ -240,8 +253,7 @@ Item {
       root.pendingStateBody = body
       return
     }
-    stateWriteProc.command = helperCommand(["state-write", root.statePath, body])
-    stateWriteProc.running = true
+    runHelperWithPayload(stateWriteProc, ["state-write", root.statePath], body)
   }
 
   Process {
@@ -250,8 +262,7 @@ Item {
       if (root.pendingStateBody === "") return
       var queued = root.pendingStateBody
       root.pendingStateBody = ""
-      stateWriteProc.command = root.helperCommand(["state-write", root.statePath, queued])
-      stateWriteProc.running = true
+      root.runHelperWithPayload(stateWriteProc, ["state-write", root.statePath], queued)
     }
   }
 
@@ -514,6 +525,9 @@ Item {
 
   // ---- Notifications + sound ----------------------------------------------
 
+  // Notification text is passed to omarchy-notification-send as argv,
+  // which other local users can read via /proc, so it never includes the
+  // task label — only fixed, non-personal strings.
   function notify(headline, body, urgency) {
     if (!root.omarchyPath) return
     Quickshell.execDetached([
@@ -523,7 +537,7 @@ Item {
   }
 
   function notifyPreWarning(seconds) {
-    var body = root.taskLabel ? ("Wrap up: " + root.taskLabel) : "Wrap up your current task"
+    var body = "Wrap up your current task"
     var left = seconds >= 60 && seconds % 60 === 0 ? (seconds / 60) + " min" : seconds + "s"
     notify(left + " left in focus", body, "low")
   }
@@ -531,7 +545,7 @@ Item {
   function announcePhaseEnd(phaseName, next, run) {
     var upNext = run ? "" : " Click the bar to start the " + Model.phaseLabel(next).toLowerCase() + "."
     if (phaseName === Model.PHASE_WORK) {
-      notify("Focus complete", (root.taskLabel ? ("Nice work on: " + root.taskLabel + ".") : "Time for a break.") + upNext, "normal")
+      notify("Focus complete", "Nice work. Time for a break." + upNext, "normal")
     } else {
       notify(Model.phaseLabel(phaseName) + " over", "Back to focus." + upNext, "normal")
     }
@@ -540,7 +554,7 @@ Item {
 
   function announcePhaseStart(phaseName) {
     if (phaseName === Model.PHASE_WORK) {
-      notify("Focus starts now", root.taskLabel ? ("Focus: " + root.taskLabel) : "Starting focus.", "low")
+      notify("Focus starts now", "Starting focus.", "low")
     } else if (phaseName === Model.PHASE_SHORT_BREAK) {
       notify("Short break", "Step away for a few minutes.", "low")
     } else if (phaseName === Model.PHASE_LONG_BREAK) {

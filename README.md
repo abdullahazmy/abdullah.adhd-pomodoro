@@ -103,6 +103,14 @@ slate.
 - `paplay` (from `pulseaudio-utils` / `pipewire-pulse`) — only used for
   the optional end-of-phase chime; the plugin silently no-ops if missing.
 
+## Privacy
+
+Task labels and session records stay out of process command lines,
+which any local user can read through `/proc/<pid>/cmdline`. The
+helper receives state bodies and history lines through its environment
+(`/proc/<pid>/environ` is owner-only) and refuses them as arguments.
+Desktop notifications use fixed text and never include the task label.
+
 ## Uninstall safety
 
 This plugin only writes inside `~/.local/state/abdullah.adhd-pomodoro/`
